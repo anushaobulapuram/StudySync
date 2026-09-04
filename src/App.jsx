@@ -27,7 +27,7 @@ export default function App() {
   // Sticky Notes State
   const [stickyNotes, setStickyNotes] = useState([]);
 
-  // Session State (Connected to Login Modal)
+  // Session State
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [userName, setUserName] = useState('');
   const [roomId, setRoomId] = useState('');
@@ -54,15 +54,24 @@ export default function App() {
     syncZoomGlobally: true,
   });
 
-  // Tools: 'pencil' | 'highlighter' | 'smart' | 'laser' | 'sticky' | 'eraser' | 'text' | 'extract' | shapes
+  // Tools: 'select' | 'pencil' | 'highlighter' | 'smart' | 'laser' | 'sticky' | 'eraser' | 'text' | 'extract' | shapes
   const [tool, setTool] = useState('pencil');
   const [color, setColor] = useState('#2563eb');
   const [lineWidth, setLineWidth] = useState(3);
   const [isDrawing, setIsDrawing] = useState(false);
 
-  // Smart Draw & Laser Points
-  const currentStrokeRef = useRef([]);
+  // Magic / Laser Points & Fade Loop (1.5 seconds lifespan)
   const laserPointsRef = useRef([]);
+
+  // Dynamic Object Canvas Engine for Move / Drag Feature
+  const elementsRef = useRef([]);
+  const [selectedElementIndex, setSelectedElementIndex] = useState(null);
+  const dragStartPosRef = useRef({ x: 0, y: 0 });
+  const isDraggingElementRef = useRef(false);
+
+  // Smart Draw Points
+  const currentStrokeRef = useRef([]);
+  const strokeStartTimeRef = useRef(0);
 
   // Infinite Scroll & Zoom Viewport
   const [zoomScale, setZoomScale] = useState(1);
@@ -94,10 +103,6 @@ export default function App() {
   // Document Presence
   const [hasDocument, setHasDocument] = useState(false);
 
-  // History Stacks
-  const [history, setHistory] = useState([]);
-  const [historyStep, setHistoryStep] = useState(-1);
-
   // Popover Toggles
   const [showShapesMenu, setShowShapesMenu] = useState(false);
   const [showColorPalette, setShowColorPalette] = useState(false);
@@ -127,7 +132,6 @@ export default function App() {
     zoomScaleRef.current = zoomScale;
   }, [zoomScale]);
 
-  // Read URL query params on mount
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const existingRoom = urlParams.get('room');
@@ -136,7 +140,6 @@ export default function App() {
     }
   }, []);
 
-  // Connect Login Screen to Whiteboard Session
   const handleLaunchSession = ({ roomId: targetRoom, isHost: hostStatus, userName: name, settings }) => {
     setRoomId(targetRoom);
     setIsHost(hostStatus);
@@ -148,10 +151,10 @@ export default function App() {
     window.history.replaceState({}, '', `?room=${targetRoom}&host=${hostStatus}`);
   };
 
-  // Infinite board area for writing continuous sums & problems
   const CANVAS_WIDTH = 4000;
   const CANVAS_HEIGHT = 10000;
 
+  // Real-time Canvas Rendering and Supabase Mesh
   useEffect(() => {
     if (!isSessionActive || !roomId) return;
 
@@ -180,26 +183,22 @@ export default function App() {
     laserCtx.lineJoin = 'round';
     laserCtxRef.current = laserCtx;
 
-    const initialData = drawCtx.getImageData(0, 0, drawCanvas.width, drawCanvas.height);
-    setHistory([initialData]);
-    setHistoryStep(0);
-
     const channel = supabase.channel(`room-${roomId}`, {
       config: { broadcast: { self: false } },
     });
 
     channel
-      .on('broadcast', { event: 'draw-stroke' }, ({ payload }) => applyRemoteStroke(payload))
-      .on('broadcast', { event: 'draw-shape' }, ({ payload }) => applyRemoteShape(payload))
-      .on('broadcast', { event: 'draw-text' }, ({ payload }) => applyRemoteText(payload))
+      .on('broadcast', { event: 'sync-elements' }, ({ payload }) => {
+        elementsRef.current = payload.elements;
+        redrawCanvas();
+      })
       .on('broadcast', { event: 'draw-laser' }, ({ payload }) => addLaserPoint(payload.x, payload.y))
       .on('broadcast', { event: 'chat-message' }, ({ payload }) => setMessages((prev) => [...prev, payload]))
       .on('broadcast', { event: 'sync-stickies' }, ({ payload }) => setStickyNotes(payload.stickies))
       .on('broadcast', { event: 'clear-board' }, () => {
-        const dCanvas = drawCanvasRef.current;
-        drawCtxRef.current.clearRect(0, 0, dCanvas.width, dCanvas.height);
+        elementsRef.current = [];
+        redrawCanvas();
       })
-      .on('broadcast', { event: 'sync-canvas-state' }, ({ payload }) => loadCanvasDataUrl(payload.dataUrl))
       .on('broadcast', { event: 'cursor-move' }, ({ payload }) => setRemoteCursor(payload))
       .on('broadcast', { event: 'permissions-update' }, ({ payload }) => setPermissions(payload))
       .on('broadcast', { event: 'sync-view' }, ({ payload }) => {
@@ -240,7 +239,175 @@ export default function App() {
     };
   }, [isSessionActive, roomId]);
 
-  // Infinite Native Wheel Scroll & Pinch Zoom Listener
+  // =========================================================================
+  // 1.5 SECONDS MAGIC / LASER PEN FADE ANIMATION LOOP
+  // =========================================================================
+  useEffect(() => {
+    if (!isSessionActive) return;
+    let animId;
+    const LASER_LIFESPAN = 1500; // Exact 1.5 seconds
+
+    const renderLaser = () => {
+      const ctx = laserCtxRef.current;
+      const canvas = laserCanvasRef.current;
+      if (!ctx || !canvas) return;
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const now = Date.now();
+
+      // Remove points older than 1.5s
+      laserPointsRef.current = laserPointsRef.current.filter((p) => now - p.time < LASER_LIFESPAN);
+
+      const pts = laserPointsRef.current;
+      for (let i = 1; i < pts.length; i++) {
+        const p1 = pts[i - 1];
+        const p2 = pts[i];
+        if (p2.isStart) continue;
+
+        const age = now - p2.time;
+        const opacity = Math.max(0, 1 - age / LASER_LIFESPAN);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.strokeStyle = `rgba(239, 68, 68, ${opacity})`;
+        ctx.lineWidth = 6;
+        ctx.lineCap = 'round';
+        ctx.shadowColor = '#ef4444';
+        ctx.shadowBlur = 12;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      animId = requestAnimationFrame(renderLaser);
+    };
+
+    animId = requestAnimationFrame(renderLaser);
+    return () => cancelAnimationFrame(animId);
+  }, [isSessionActive]);
+
+  const addLaserPoint = (x, y, isStart = false) => {
+    laserPointsRef.current.push({ x, y, time: Date.now(), isStart });
+  };
+
+  // =========================================================================
+  // MOVE / DRAG SELECTION BOUNDS & ENGINE
+  // =========================================================================
+  const redrawCanvas = () => {
+    const ctx = drawCtxRef.current;
+    const canvas = drawCanvasRef.current;
+    if (!ctx || !canvas) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    elementsRef.current.forEach((el, index) => {
+      ctx.save();
+      if (el.isHighlighter) {
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 0.35;
+        ctx.strokeStyle = el.color;
+        ctx.lineWidth = el.width * 5;
+        ctx.lineCap = 'square';
+      } else if (el.isEraser) {
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.lineWidth = el.width * 6;
+      } else {
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 1.0;
+        ctx.strokeStyle = el.color;
+        ctx.fillStyle = el.color;
+        ctx.lineWidth = el.width;
+      }
+
+      if (el.type === 'stroke' && el.points && el.points.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(el.points[0].x, el.points[0].y);
+        for (let i = 1; i < el.points.length; i++) {
+          ctx.lineTo(el.points[i].x, el.points[i].y);
+        }
+        ctx.stroke();
+      } else if (el.type === 'shape') {
+        drawShapeDirect(ctx, el.shapeTool, el.fromX, el.fromY, el.toX, el.toY);
+      } else if (el.type === 'text') {
+        ctx.font = `700 ${el.fontSize}px Inter, sans-serif`;
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillText(el.text, el.x, el.y);
+      }
+
+      // Visual Bounding Box when selected
+      if (tool === 'select' && selectedElementIndex === index) {
+        const bounds = getElementBounds(el);
+        ctx.restore();
+        ctx.save();
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 6]);
+        ctx.strokeRect(bounds.minX - 6, bounds.minY - 6, bounds.width + 12, bounds.height + 12);
+      }
+      ctx.restore();
+    });
+  };
+
+  const broadcastAllElements = () => {
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'sync-elements',
+      payload: { elements: elementsRef.current },
+    });
+  };
+
+  const getElementBounds = (el) => {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+
+    if (el.type === 'stroke' && el.points) {
+      el.points.forEach((p) => {
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+      });
+    } else if (el.type === 'shape') {
+      minX = Math.min(el.fromX, el.toX);
+      maxX = Math.max(el.fromX, el.toX);
+      minY = Math.min(el.fromY, el.toY);
+      maxY = Math.max(el.fromY, el.toY);
+    } else if (el.type === 'text') {
+      minX = el.x;
+      maxX = el.x + (el.fontSize * (el.text?.length || 1) * 0.6);
+      minY = el.y - el.fontSize;
+      maxY = el.y;
+    }
+
+    return { minX, maxX, minY, maxY, width: Math.max(maxX - minX, 10), height: Math.max(maxY - minY, 10) };
+  };
+
+  const isPointInsideElement = (x, y, el) => {
+    const b = getElementBounds(el);
+    const padding = 18;
+    return (
+      x >= b.minX - padding &&
+      x <= b.maxX + padding &&
+      y >= b.minY - padding &&
+      y <= b.maxY + padding
+    );
+  };
+
+  const moveElementByDelta = (el, dx, dy) => {
+    if (el.type === 'stroke' && el.points) {
+      el.points = el.points.map((p) => ({ ...p, x: p.x + dx, y: p.y + dy }));
+    } else if (el.type === 'shape') {
+      el.fromX += dx;
+      el.fromY += dy;
+      el.toX += dx;
+      el.toY += dy;
+    } else if (el.type === 'text') {
+      el.x += dx;
+      el.y += dy;
+    }
+  };
+
+  // Wheel Zoom & Pan
   useEffect(() => {
     if (!isSessionActive) return;
 
@@ -248,7 +415,6 @@ export default function App() {
       e.preventDefault();
 
       if (e.ctrlKey || e.metaKey) {
-        // Zoom in / Zoom out relative to cursor
         const zoomFactor = e.deltaY < 0 ? 1.05 : 0.95;
         const newScale = Math.min(Math.max(Number((zoomScaleRef.current * zoomFactor).toFixed(2)), 0.3), 3.0);
         setZoomScale(newScale);
@@ -261,7 +427,6 @@ export default function App() {
           });
         }
       } else {
-        // Natural Multi-directional Scroll (Down, Up, Side to continue writing)
         const newPan = {
           x: panOffsetRef.current.x - e.deltaX,
           y: panOffsetRef.current.y - e.deltaY,
@@ -287,7 +452,7 @@ export default function App() {
     };
   }, [isHost, permissions.syncZoomGlobally, isSessionActive]);
 
-  // Context properties based on current tool (Highlighter / Eraser / Pencil)
+  // Context properties
   useEffect(() => {
     if (!drawCtxRef.current) return;
     const ctx = drawCtxRef.current;
@@ -299,7 +464,7 @@ export default function App() {
       ctx.lineCap = 'round';
     } else if (tool === 'highlighter') {
       ctx.globalCompositeOperation = 'source-over';
-      ctx.globalAlpha = 0.35; // Translucent so text underneath is visible
+      ctx.globalAlpha = 0.35;
       ctx.strokeStyle = color === '#0f172a' ? '#facc15' : color;
       ctx.lineWidth = lineWidth * 5;
       ctx.lineCap = 'square';
@@ -313,7 +478,7 @@ export default function App() {
     }
   }, [color, lineWidth, tool]);
 
-  // Screen & Mic Recorder
+  // Screen Recorder
   const startRecording = async () => {
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
@@ -396,7 +561,7 @@ export default function App() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Sticky Notes Logic
+  // Sticky Notes
   const addStickyNote = (x, y) => {
     const newSticky = {
       id: Date.now(),
@@ -450,19 +615,26 @@ export default function App() {
     const distStartEnd = Math.hypot(end.x - start.x, end.y - start.y);
 
     // Line
-    if (distStartEnd > Math.max(width, height) * 0.88 && points.length < 45) {
-      drawShapeDirect(ctx, 'line', start.x, start.y, end.x, end.y);
-      channelRef.current?.send({
-        type: 'broadcast',
-        event: 'draw-shape',
-        payload: { shapeTool: 'line', fromX: start.x, fromY: start.y, toX: end.x, toY: end.y, color, width: lineWidth },
+    if (distStartEnd > Math.max(width, height) * 0.92 && points.length < 40) {
+      elementsRef.current.push({
+        id: Date.now(),
+        type: 'shape',
+        shapeTool: 'line',
+        fromX: start.x,
+        fromY: start.y,
+        toX: end.x,
+        toY: end.y,
+        color,
+        width: lineWidth,
       });
+      redrawCanvas();
+      broadcastAllElements();
       return true;
     }
 
     // Closed shapes
-    const isClosed = distStartEnd < Math.max(width, height) * 0.32;
-    if (isClosed && width > 30 && height > 30) {
+    const isClosed = distStartEnd < Math.max(width, height) * 0.25;
+    if (isClosed && width > 40 && height > 40 && points.length > 25) {
       const centerX = minX + width / 2;
       const centerY = minY + height / 2;
       const radius = (width + height) / 4;
@@ -475,24 +647,39 @@ export default function App() {
       radVariance /= points.length;
 
       // Circle
-      if (radVariance < radius * 0.22 && Math.abs(width - height) < Math.max(width, height) * 0.28) {
-        drawShapeDirect(ctx, 'circle', centerX, centerY, centerX + radius, centerY);
-        channelRef.current?.send({
-          type: 'broadcast',
-          event: 'draw-shape',
-          payload: { shapeTool: 'circle', fromX: centerX, fromY: centerY, toX: centerX + radius, toY: centerY, color, width: lineWidth },
+      if (radVariance < radius * 0.16 && Math.abs(width - height) < Math.max(width, height) * 0.20) {
+        elementsRef.current.push({
+          id: Date.now(),
+          type: 'shape',
+          shapeTool: 'circle',
+          fromX: centerX,
+          fromY: centerY,
+          toX: centerX + radius,
+          toY: centerY,
+          color,
+          width: lineWidth,
         });
+        redrawCanvas();
+        broadcastAllElements();
         return true;
       }
 
       // Rectangle
-      if (radVariance > radius * 0.35 && points.length > 20) {
-        drawShapeDirect(ctx, 'rectangle', minX, minY, maxX, maxY);
-        channelRef.current?.send({
-          type: 'broadcast',
-          event: 'draw-shape',
-          payload: { shapeTool: 'rectangle', fromX: minX, fromY: minY, toX: maxX, toY: maxY, color, width: lineWidth },
+      const aspect = width / height;
+      if (radVariance > radius * 0.28 && aspect > 0.65 && aspect < 1.55 && points.length > 35) {
+        elementsRef.current.push({
+          id: Date.now(),
+          type: 'shape',
+          shapeTool: 'rectangle',
+          fromX: minX,
+          fromY: minY,
+          toX: maxX,
+          toY: maxY,
+          color,
+          width: lineWidth,
         });
+        redrawCanvas();
+        broadcastAllElements();
         return true;
       }
     }
@@ -501,7 +688,7 @@ export default function App() {
     try {
       const strokeX = points.map((p) => Math.round(p.x));
       const strokeY = points.map((p) => Math.round(p.y));
-      const strokeT = points.map((_, i) => i * 16);
+      const strokeT = points.map((p) => Math.round(p.t - (points[0]?.t || 0)));
 
       const requestBody = {
         app_version: 0.3,
@@ -513,7 +700,7 @@ export default function App() {
           {
             writing_guide: { writing_area_width: CANVAS_WIDTH, writing_area_height: CANVAS_HEIGHT },
             pre_context: '',
-            max_num_results: 1,
+            max_num_results: 3,
             max_completions: 0,
             language: 'en',
             ink: [[strokeX, strokeY, strokeT]],
@@ -532,74 +719,29 @@ export default function App() {
 
       const data = await response.json();
       if (data && data[0] === 'SUCCESS' && data[1] && data[1][0] && data[1][0][1]) {
-        const recognizedChar = data[1][0][1][0];
+        const recognized = data[1][0][1][0];
 
-        if (recognizedChar && recognizedChar.trim()) {
-          const fontSize = Math.max(Math.round(height * 0.95), 26);
-          const targetX = minX;
-          const targetY = minY + height;
-
-          ctx.font = `600 ${fontSize}px Inter, sans-serif`;
-          ctx.fillStyle = color;
-          ctx.fillText(recognizedChar, targetX, targetY);
-
-          channelRef.current?.send({
-            type: 'broadcast',
-            event: 'draw-text',
-            payload: { text: recognizedChar, x: targetX, y: targetY, color, fontSize },
+        if (recognized && recognized.trim().length > 0) {
+          const fontSize = Math.max(Math.round(height * 1.05), 32);
+          elementsRef.current.push({
+            id: Date.now(),
+            type: 'text',
+            text: recognized,
+            x: minX,
+            y: maxY,
+            color,
+            fontSize,
           });
+          redrawCanvas();
+          broadcastAllElements();
           return true;
         }
       }
     } catch (err) {
-      console.warn('Handwriting API fallback:', err);
+      console.warn('Handwriting error:', err);
     }
 
     return false;
-  };
-
-  // Laser Animation Loop
-  useEffect(() => {
-    let animId;
-    const renderLaser = () => {
-      const ctx = laserCtxRef.current;
-      const canvas = laserCanvasRef.current;
-      if (!ctx || !canvas) return;
-
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const now = Date.now();
-      laserPointsRef.current = laserPointsRef.current.filter((p) => now - p.time < 1200);
-
-      const pts = laserPointsRef.current;
-      for (let i = 1; i < pts.length; i++) {
-        const p1 = pts[i - 1];
-        const p2 = pts[i];
-        if (p2.isStart) continue;
-
-        const age = now - p2.time;
-        const opacity = Math.max(0, 1 - age / 1200);
-
-        ctx.save();
-        ctx.beginPath();
-        ctx.moveTo(p1.x, p1.y);
-        ctx.lineTo(p2.x, p2.y);
-        ctx.strokeStyle = `rgba(239, 68, 68, ${opacity})`;
-        ctx.lineWidth = 6;
-        ctx.shadowColor = '#ef4444';
-        ctx.shadowBlur = 10;
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      animId = requestAnimationFrame(renderLaser);
-    };
-
-    animId = requestAnimationFrame(renderLaser);
-    return () => cancelAnimationFrame(animId);
-  }, []);
-
-  const addLaserPoint = (x, y, isStart = false) => {
-    laserPointsRef.current.push({ x, y, time: Date.now(), isStart });
   };
 
   // Chat
@@ -814,65 +956,13 @@ export default function App() {
     }
   };
 
-  // Undo/Redo
-  const broadcastCurrentState = () => {
-    const drawCanvas = drawCanvasRef.current;
-    const dataUrl = drawCanvas.toDataURL();
-    channelRef.current?.send({
-      type: 'broadcast',
-      event: 'sync-canvas-state',
-      payload: { dataUrl },
-    });
-  };
-
-  const loadCanvasDataUrl = (dataUrl) => {
-    const img = new Image();
-    img.onload = () => {
-      const drawCanvas = drawCanvasRef.current;
-      const ctx = drawCtxRef.current;
-      ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
-      ctx.drawImage(img, 0, 0);
-    };
-    img.src = dataUrl;
-  };
-
-  const pushToHistory = () => {
-    const drawCanvas = drawCanvasRef.current;
-    const drawCtx = drawCtxRef.current;
-    const currentData = drawCtx.getImageData(0, 0, drawCanvas.width, drawCanvas.height);
-    const newHistory = history.slice(0, historyStep + 1);
-    newHistory.push(currentData);
-    setHistory(newHistory);
-    setHistoryStep(newHistory.length - 1);
-  };
-
-  const handleUndo = () => {
-    if (historyStep > 0) {
-      const prevStep = historyStep - 1;
-      const drawCtx = drawCtxRef.current;
-      drawCtx.putImageData(history[prevStep], 0, 0);
-      setHistoryStep(prevStep);
-      broadcastCurrentState();
-    }
-  };
-
-  const handleRedo = () => {
-    if (historyStep < history.length - 1) {
-      const nextStep = historyStep + 1;
-      const drawCtx = drawCtxRef.current;
-      drawCtx.putImageData(history[nextStep], 0, 0);
-      setHistoryStep(nextStep);
-      broadcastCurrentState();
-    }
-  };
-
   useEffect(() => {
     if (textInput.visible && textInputRef.current) {
       setTimeout(() => textInputRef.current.focus(), 50);
     }
   }, [textInput.visible]);
 
-  // Robust Single Page Document Rendering (Instant Sync, 0 Drop)
+  // Robust Single Page Document Rendering
   const renderImageOnCanvas = (dataUrl) => {
     const img = new Image();
     img.onload = () => {
@@ -882,7 +972,6 @@ export default function App() {
       bgCtx.fillStyle = '#ffffff';
       bgCtx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-      // Clean centered worksheet placement
       const x = Math.max(60, (window.innerWidth - img.width) / 2);
       bgCtx.drawImage(img, x, 40);
       setHasDocument(true);
@@ -890,7 +979,6 @@ export default function App() {
     img.src = dataUrl;
   };
 
-  // Render 1 Page of PDF (Lightweight ~80KB, 100% Reliable over WebSocket)
   const renderPdfSinglePage = async (pdf, targetPage, broadcast = true) => {
     try {
       const page = await pdf.getPage(targetPage);
@@ -983,7 +1071,7 @@ export default function App() {
     }
   };
 
-  // OCR Extraction with Immediate Notes Pad Sync
+  // OCR Extraction
   const extractTextFromRegion = async (x1, y1, x2, y2) => {
     const minX = Math.min(x1, x2);
     const minY = Math.min(y1, y2);
@@ -1060,93 +1148,29 @@ export default function App() {
     document.body.removeChild(element);
   };
 
-  // Remote Receivers
-  const applyRemoteStroke = ({ fromX, fromY, toX, toY, color: remoteColor, width, isEraser, isHighlighter }) => {
-    const ctx = drawCtxRef.current;
-    const prevOp = ctx.globalCompositeOperation;
-    const prevAlpha = ctx.globalAlpha;
-    const prevColor = ctx.strokeStyle;
-    const prevWidth = ctx.lineWidth;
-
-    if (isEraser) {
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.globalAlpha = 1.0;
-    } else if (isHighlighter) {
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.globalAlpha = 0.35;
-    } else {
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.globalAlpha = 1.0;
-    }
-
-    ctx.strokeStyle = remoteColor;
-    ctx.lineWidth = width;
-
-    ctx.beginPath();
-    ctx.moveTo(fromX, fromY);
-    ctx.lineTo(toX, toY);
-    ctx.stroke();
-
-    ctx.globalCompositeOperation = prevOp;
-    ctx.globalAlpha = prevAlpha;
-    ctx.strokeStyle = prevColor;
-    ctx.lineWidth = prevWidth;
-  };
-
-  const applyRemoteShape = ({ shapeTool, fromX, fromY, toX, toY, color: remoteColor, width }) => {
-    const ctx = drawCtxRef.current;
-    const prevColor = ctx.strokeStyle;
-    const prevFill = ctx.fillStyle;
-    const prevWidth = ctx.lineWidth;
-    const prevOp = ctx.globalCompositeOperation;
-
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.strokeStyle = remoteColor;
-    ctx.fillStyle = remoteColor;
-    ctx.lineWidth = width;
-
-    drawShapeDirect(ctx, shapeTool, fromX, fromY, toX, toY);
-
-    ctx.strokeStyle = prevColor;
-    ctx.fillStyle = prevFill;
-    ctx.lineWidth = prevWidth;
-    ctx.globalCompositeOperation = prevOp;
-  };
-
-  const applyRemoteText = ({ text, x, y, color: remoteColor, fontSize }) => {
-    const ctx = drawCtxRef.current;
-    const prevFill = ctx.fillStyle;
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.font = `600 ${fontSize}px Inter, sans-serif`;
-    ctx.fillStyle = remoteColor;
-    ctx.fillText(text, x, y);
-    ctx.fillStyle = prevFill;
-  };
-
   const commitText = () => {
     if (!textInput.text.trim()) {
       setTextInput({ visible: false, x: 0, y: 0, text: '' });
       return;
     }
-    const ctx = drawCtxRef.current;
-    ctx.globalCompositeOperation = 'source-over';
-    const fontSize = Math.max(lineWidth * 5, 20);
-    ctx.font = `600 ${fontSize}px Inter, sans-serif`;
-    ctx.fillStyle = color;
+    const fontSize = Math.max(lineWidth * 5, 22);
     const targetY = textInput.y + fontSize * 0.8;
-    ctx.fillText(textInput.text, textInput.x, targetY);
 
-    channelRef.current?.send({
-      type: 'broadcast',
-      event: 'draw-text',
-      payload: { text: textInput.text, x: textInput.x, y: targetY, color, fontSize },
+    elementsRef.current.push({
+      id: Date.now(),
+      type: 'text',
+      text: textInput.text,
+      x: textInput.x,
+      y: targetY,
+      color,
+      fontSize,
     });
 
+    redrawCanvas();
+    broadcastAllElements();
     setTextInput({ visible: false, x: 0, y: 0, text: '' });
-    pushToHistory();
   };
 
-  // Real Infinite Coordinates Map
   const getCanvasCoords = (e) => {
     const rect = viewportRef.current.getBoundingClientRect();
     return {
@@ -1157,18 +1181,38 @@ export default function App() {
 
   const canUserDraw = isHost || permissions.canDraw;
 
+  // =========================================================================
+  // MOUSE & TOUCH HANDLERS (Drawing + Move Tool + Magic Pen 1.5s)
+  // =========================================================================
   const handleMouseDown = (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'TEXTAREA') return;
 
-    if (tool === 'sticky') {
-      const { x, y } = getCanvasCoords(e);
-      addStickyNote(x, y);
+    const { x, y } = getCanvasCoords(e);
+    setShowShapesMenu(false);
+    setShowColorPalette(false);
+
+    // 1. SELECT & MOVE TOOL (Pakkaki drag cheyatam)
+    if (tool === 'select') {
+      let foundIndex = null;
+      for (let i = elementsRef.current.length - 1; i >= 0; i--) {
+        if (isPointInsideElement(x, y, elementsRef.current[i])) {
+          foundIndex = i;
+          break;
+        }
+      }
+
+      setSelectedElementIndex(foundIndex);
+      if (foundIndex !== null) {
+        isDraggingElementRef.current = true;
+        dragStartPosRef.current = { x, y };
+      }
+      redrawCanvas();
       return;
     }
 
+    // 2. MAGIC / LASER PEN (1.5 seconds fade out)
     if (tool === 'laser') {
       setIsDrawing(true);
-      const { x, y } = getCanvasCoords(e);
       addLaserPoint(x, y, true);
       channelRef.current?.send({
         type: 'broadcast',
@@ -1178,11 +1222,12 @@ export default function App() {
       return;
     }
 
-    if (!canUserDraw && tool !== 'extract') return;
+    if (tool === 'sticky') {
+      addStickyNote(x, y);
+      return;
+    }
 
-    const { x, y } = getCanvasCoords(e);
-    setShowShapesMenu(false);
-    setShowColorPalette(false);
+    if (!canUserDraw && tool !== 'extract') return;
 
     if (tool === 'text') {
       if (textInput.visible) commitText();
@@ -1199,7 +1244,8 @@ export default function App() {
     setSnapshot(drawCtxRef.current.getImageData(0, 0, drawCanvas.width, drawCanvas.height));
 
     if (['pencil', 'eraser', 'highlighter', 'smart'].includes(tool)) {
-      currentStrokeRef.current = [{ x, y }];
+      strokeStartTimeRef.current = Date.now();
+      currentStrokeRef.current = [{ x, y, t: 0 }];
       drawCtxRef.current.beginPath();
       drawCtxRef.current.moveTo(x, y);
     }
@@ -1266,6 +1312,23 @@ export default function App() {
   const handleMouseMove = (e) => {
     const { x, y } = getCanvasCoords(e);
 
+    // 1. Drag & Move Selected Element
+    if (tool === 'select') {
+      if (isDraggingElementRef.current && selectedElementIndex !== null) {
+        const dx = x - dragStartPosRef.current.x;
+        const dy = y - dragStartPosRef.current.y;
+        dragStartPosRef.current = { x, y };
+
+        const targetEl = elementsRef.current[selectedElementIndex];
+        if (targetEl) {
+          moveElementByDelta(targetEl, dx, dy);
+          redrawCanvas();
+        }
+      }
+      return;
+    }
+
+    // 2. Laser Points Trail
     if (tool === 'laser' && isDrawing) {
       addLaserPoint(x, y);
       channelRef.current?.send({
@@ -1293,29 +1356,12 @@ export default function App() {
     if (tool === 'pencil' || tool === 'eraser' || tool === 'highlighter') {
       ctx.lineTo(x, y);
       ctx.stroke();
-
-      const isEraser = tool === 'eraser';
-      const isHighlighter = tool === 'highlighter';
-
-      channelRef.current?.send({
-        type: 'broadcast',
-        event: 'draw-stroke',
-        payload: {
-          fromX: startPos.x,
-          fromY: startPos.y,
-          toX: x,
-          toY: y,
-          color: isHighlighter ? (color === '#0f172a' ? '#facc15' : color) : color,
-          width: isEraser ? lineWidth * 6 : isHighlighter ? lineWidth * 5 : lineWidth,
-          isEraser,
-          isHighlighter,
-        },
-      });
-      setStartPos({ x, y });
+      currentStrokeRef.current.push({ x, y });
     } else if (tool === 'smart') {
       ctx.lineTo(x, y);
       ctx.stroke();
-      currentStrokeRef.current.push({ x, y });
+      const t = Date.now() - strokeStartTimeRef.current;
+      currentStrokeRef.current.push({ x, y, t });
     } else if (tool === 'extract' && snapshot) {
       ctx.putImageData(snapshot, 0, 0);
       ctx.save();
@@ -1342,6 +1388,16 @@ export default function App() {
   };
 
   const handleMouseUp = (e) => {
+    // 1. Release Move Drag
+    if (tool === 'select') {
+      if (isDraggingElementRef.current) {
+        isDraggingElementRef.current = false;
+        broadcastAllElements();
+      }
+      return;
+    }
+
+    // 2. Release Laser
     if (tool === 'laser') {
       setIsDrawing(false);
       return;
@@ -1365,43 +1421,57 @@ export default function App() {
 
       if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
       recognizeAndDrawSmartShape(strokePoints, drawCtxRef.current).then((converted) => {
-        if (!converted && snapshot) {
-          drawCtxRef.current.putImageData(snapshot, 0, 0);
+        if (!converted) {
+          elementsRef.current.push({
+            id: Date.now(),
+            type: 'stroke',
+            points: strokePoints,
+            color,
+            width: lineWidth,
+          });
+          redrawCanvas();
+          broadcastAllElements();
         }
-        pushToHistory();
       });
       return;
     }
 
     if (['pencil', 'eraser', 'highlighter'].includes(tool)) {
       drawCtxRef.current.closePath();
+      elementsRef.current.push({
+        id: Date.now(),
+        type: 'stroke',
+        points: [...currentStrokeRef.current],
+        color,
+        width: lineWidth,
+        isHighlighter: tool === 'highlighter',
+        isEraser: tool === 'eraser',
+      });
+      currentStrokeRef.current = [];
+      broadcastAllElements();
     } else {
       if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
-      drawShapeDirect(drawCtxRef.current, tool, startPos.x, startPos.y, x, y);
-
-      channelRef.current?.send({
-        type: 'broadcast',
-        event: 'draw-shape',
-        payload: {
-          shapeTool: tool,
-          fromX: startPos.x,
-          fromY: startPos.y,
-          toX: x,
-          toY: y,
-          color,
-          width: lineWidth,
-        },
+      elementsRef.current.push({
+        id: Date.now(),
+        type: 'shape',
+        shapeTool: tool,
+        fromX: startPos.x,
+        fromY: startPos.y,
+        toX: x,
+        toY: y,
+        color,
+        width: lineWidth,
       });
+      redrawCanvas();
+      broadcastAllElements();
     }
-    pushToHistory();
   };
 
   const clearCanvas = () => {
     if (!canUserDraw) return;
-    const drawCanvas = drawCanvasRef.current;
-    drawCtxRef.current.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+    elementsRef.current = [];
+    redrawCanvas();
     setTextInput({ visible: false, x: 0, y: 0, text: '' });
-    pushToHistory();
 
     channelRef.current?.send({
       type: 'broadcast',
@@ -1418,9 +1488,7 @@ export default function App() {
 
   const isShapeActive = ['rectangle', 'circle', 'line', 'arrow', 'triangle', 'star'].includes(tool);
 
-  // =========================================================================
-  // 1. SHOW 3D RIBBON LOGIN MODAL IF SESSION NOT ACTIVE
-  // =========================================================================
+  // 1. Show Clean Lavender & Warm Cream Split Login Modal
   if (!isSessionActive) {
     return (
       <AuthRoomModal
@@ -1430,14 +1498,12 @@ export default function App() {
     );
   }
 
-  // =========================================================================
-  // 2. DISPLAY EXACT SAME WHITEBOARD WORKSPACE (FIXED HEADER & DOCK LAYOUT)
-  // =========================================================================
+  // 2. Main Whiteboard Workspace
   return (
     <div className="relative w-screen h-screen overflow-hidden select-none font-['Inter',sans-serif] bg-slate-100 text-slate-800">
       <audio ref={remoteAudioRef} autoPlay playsInline />
 
-      {/* FIXED TOP HEADER (Screen meeda cut avvakunda eppudu perfect ga kanipisthundi) */}
+      {/* FIXED TOP HEADER */}
       <header className="fixed top-0 left-0 right-0 h-14 bg-white/95 backdrop-blur-md border-b border-slate-200 px-5 flex items-center justify-between z-40 shadow-sm">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white font-black text-sm shadow-sm">
@@ -1556,7 +1622,6 @@ export default function App() {
 
       {/* FIXED BOTTOM FLOATING WORKSPACE DOCK */}
       <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-white/95 backdrop-blur-xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] border border-slate-200/90 rounded-2xl px-4 py-2 flex items-center gap-3 z-40">
-        {/* Natural Zoom Controls */}
         <div className="flex items-center gap-1 bg-slate-100 px-2 py-1 rounded-xl text-xs font-mono">
           <button onClick={() => handleZoom(-0.1)} className="hover:text-blue-600 font-bold px-1">−</button>
           <span>{Math.round(zoomScale * 100)}%</span>
@@ -1568,10 +1633,20 @@ export default function App() {
 
         <div className="h-6 w-[1px] bg-slate-200" />
 
-        {/* Pens, Transparent Highlighter & Laser */}
+        {/* Move Tool, Pens, Highlighter & Magic Pen */}
         <div className="flex items-center gap-1">
+          {/* ✋ MOVE TOOL (Select & Drag drawings) */}
           <button
-            onClick={() => { setTool('pencil'); setShowShapesMenu(false); }}
+            onClick={() => { setTool('select'); setShowShapesMenu(false); }}
+            title="Move Tool: Click and drag any drawing to move it"
+            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
+              tool === 'select' ? 'bg-blue-600 text-white shadow-sm font-bold scale-105' : 'hover:bg-slate-100 text-slate-700'
+            }`}>
+            ✋
+          </button>
+
+          <button
+            onClick={() => { setTool('pencil'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
             title="Pen"
             className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
               tool === 'pencil' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
@@ -1580,7 +1655,7 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => { setTool('highlighter'); setShowShapesMenu(false); }}
+            onClick={() => { setTool('highlighter'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
             title="Highlighter: Transparent ink shows back text"
             className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
               tool === 'highlighter' ? 'bg-yellow-400 text-yellow-950 shadow-sm font-bold' : 'hover:bg-slate-100'
@@ -1589,7 +1664,7 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => { setTool('smart'); setShowShapesMenu(false); }}
+            onClick={() => { setTool('smart'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
             title="Smart Pen: Auto converts rough ink to crisp shapes & alphanumeric text"
             className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
               tool === 'smart' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
@@ -1597,11 +1672,12 @@ export default function App() {
             ✨
           </button>
 
+          {/* ⚡ MAGIC PEN (Fades away in 1.5 seconds) */}
           <button
-            onClick={() => { setTool('laser'); setShowShapesMenu(false); }}
-            title="Fading Laser Pointer"
+            onClick={() => { setTool('laser'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
+            title="Magic Pen: Automatically disappears in 1.5 seconds"
             className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-              tool === 'laser' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
+              tool === 'laser' ? 'bg-rose-600 text-white shadow-sm animate-pulse' : 'hover:bg-slate-100'
             }`}>
             ⚡
           </button>
@@ -1633,7 +1709,7 @@ export default function App() {
                 ].map((s) => (
                   <button
                     key={s.id}
-                    onClick={() => { setTool(s.id); setShowShapesMenu(false); }}
+                    onClick={() => { setTool(s.id); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
                     className={`px-2 py-1.5 rounded-lg text-xs font-medium text-left transition ${
                       tool === s.id ? 'bg-blue-50 text-blue-600 font-bold' : 'hover:bg-slate-100'
                     }`}>
@@ -1645,7 +1721,7 @@ export default function App() {
           </div>
 
           <button
-            onClick={() => { setTool('text'); setShowShapesMenu(false); }}
+            onClick={() => { setTool('text'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
             title="Text Box"
             className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm font-bold transition ${
               tool === 'text' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
@@ -1654,7 +1730,7 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => { setTool('sticky'); setShowShapesMenu(false); }}
+            onClick={() => { setTool('sticky'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
             title="Drop Sticky Note"
             className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
               tool === 'sticky' ? 'bg-yellow-400 text-yellow-950 shadow-sm' : 'hover:bg-slate-100'
@@ -1675,7 +1751,7 @@ export default function App() {
             📄
           </button>
           <button
-            onClick={() => { setTool('extract'); setShowShapesMenu(false); }}
+            onClick={() => { setTool('extract'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
             title="OCR Extract text to Notes Pad"
             className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
               tool === 'extract' ? 'bg-purple-600 text-white shadow-sm' : 'hover:bg-slate-100'
@@ -1718,7 +1794,7 @@ export default function App() {
           />
 
           <button
-            onClick={() => { setTool('eraser'); setShowShapesMenu(false); }}
+            onClick={() => { setTool('eraser'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
             title="Eraser"
             className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
               tool === 'eraser' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
@@ -1726,8 +1802,6 @@ export default function App() {
             🧹
           </button>
 
-          <button onClick={handleUndo} disabled={historyStep <= 0} title="Undo" className="w-7 h-7 flex items-center justify-center disabled:opacity-30 text-slate-700">↶</button>
-          <button onClick={handleRedo} disabled={historyStep >= history.length - 1} title="Redo" className="w-7 h-7 flex items-center justify-center disabled:opacity-30 text-slate-700">↷</button>
           <button onClick={clearCanvas} title="Clear Whiteboard" className="text-xs font-bold text-rose-500 hover:text-rose-700 ml-1">Clear</button>
         </div>
       </div>
@@ -1898,7 +1972,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Snap & OCR Status */}
       {snapNotice && (
         <div className="fixed top-18 left-1/2 -translate-x-1/2 z-50 bg-emerald-600 text-white px-4 py-2 rounded-xl text-xs font-semibold shadow-lg animate-bounce">
           ✓ Slide captured to in-app gallery!
@@ -1959,7 +2032,7 @@ export default function App() {
         </div>
       )}
 
-      {/* INFINITE EXPANDING CANVAS VIEWPORT (With pt-14 to never get hidden by Header) */}
+      {/* INFINITE EXPANDING CANVAS VIEWPORT */}
       <div
         ref={viewportRef}
         className="absolute inset-0 w-screen h-screen overflow-hidden pt-14 cursor-crosshair z-0">
@@ -1979,7 +2052,9 @@ export default function App() {
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseLeave}
             className={`absolute top-0 left-0 z-10 ${
-              tool === 'laser'
+              tool === 'select'
+                ? 'cursor-grab active:cursor-grabbing'
+                : tool === 'laser'
                 ? 'cursor-pointer'
                 : tool === 'highlighter'
                 ? 'cursor-crosshair'
@@ -1994,6 +2069,7 @@ export default function App() {
                 : 'cursor-crosshair'
             }`}
           />
+          {/* Laser canvas for magic pen 1.5s glow */}
           <canvas ref={laserCanvasRef} className="absolute top-0 left-0 pointer-events-none z-20" />
 
           {/* Sticky Notes */}
