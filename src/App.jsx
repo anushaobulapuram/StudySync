@@ -160,6 +160,13 @@ export default function App() {
   const panOffsetRef = useRef({ x: 0, y: 0 });
   const zoomScaleRef = useRef(1);
 
+  // Mobile two-finger navigation. One finger remains drawing/selecting;
+  // two fingers exclusively control zoom + pan so PDF/document gestures never
+  // create accidental strokes.
+  const activeTouchPointersRef = useRef(new Map());
+  const pinchGestureRef = useRef(null);
+  const suppressTouchDrawingRef = useRef(false);
+
   // Strict Private Notes State (100% private, never broadcasted, persistent)
   const [showNotesPad, setShowNotesPad] = useState(false);
   const [privateNotes, setPrivateNotes] = useState('');
@@ -1488,12 +1495,36 @@ export default function App() {
     });
   };
 
+  const applyZoomAtPoint = (nextScale, clientX, clientY) => {
+    const next = Math.max(0.5, Math.min(2.5, Number(nextScale.toFixed(2))));
+    const canvas = drawCanvasRef.current;
+    const currentScale = zoomScaleRef.current;
+    const currentPan = panOffsetRef.current;
+
+    if (canvas && currentScale > 0) {
+      const rect = canvas.getBoundingClientRect();
+      const originX = rect.left - currentPan.x;
+      const originY = rect.top - currentPan.y;
+      const worldX = (clientX - rect.left) / currentScale;
+      const worldY = (clientY - rect.top) / currentScale;
+      const nextPan = {
+        x: clientX - originX - worldX * next,
+        y: clientY - originY - worldY * next,
+      };
+      panOffsetRef.current = nextPan;
+      setPanOffset(nextPan);
+    }
+
+    zoomScaleRef.current = next;
+    setZoomScale(next);
+  };
+
   const handleZoom = (delta) => {
-    setZoomScale((prev) => {
-      const next = Math.max(0.5, Math.min(2.5, Number((prev + delta).toFixed(2))));
-      zoomScaleRef.current = next;
-      return next;
-    });
+    const viewport = viewportRef.current;
+    const rect = viewport?.getBoundingClientRect();
+    const focusX = rect ? rect.left + rect.width / 2 : window.innerWidth / 2;
+    const focusY = rect ? rect.top + rect.height / 2 : window.innerHeight / 2;
+    applyZoomAtPoint(zoomScaleRef.current + delta, focusX, focusY);
   };
 
   const handleResetZoom = () => {
@@ -1501,6 +1532,9 @@ export default function App() {
     setPanOffset({ x: 0, y: 0 });
     panOffsetRef.current = { x: 0, y: 0 };
     zoomScaleRef.current = 1;
+    pinchGestureRef.current = null;
+    activeTouchPointersRef.current.clear();
+    suppressTouchDrawingRef.current = false;
     if (isHost && permissions.syncZoomGlobally) {
       channelRef.current?.send({
         type: 'broadcast',
@@ -2199,6 +2233,7 @@ export default function App() {
   const canUserVoice = isHost || isCoHost || (userPermissions.canVoice ?? permissions.canVoiceChat);
 
   const handleMouseDown = (e) => {
+    if (e.pointerType === 'touch' && suppressTouchDrawingRef.current) return;
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'TEXTAREA') return;
 
     const { x, y } = getCanvasCoords(e);
@@ -2344,6 +2379,7 @@ export default function App() {
   };
 
   const handleMouseMove = (e) => {
+    if (e.pointerType === 'touch' && suppressTouchDrawingRef.current) return;
     const { x, y } = getCanvasCoords(e);
 
     if (tool === 'select') {
@@ -2590,7 +2626,7 @@ export default function App() {
         .studysync-header { overflow-x: auto; scrollbar-width: none; touch-action: pan-x; overscroll-behavior-x: contain; }
         .studysync-header::-webkit-scrollbar, .studysync-dock::-webkit-scrollbar { display: none; }
         .studysync-header > div { flex-shrink: 0; }
-        .studysync-dock { max-width: calc(100vw - 24px); overflow-x: auto; overflow-y: visible; scrollbar-width: none; touch-action: pan-x; overscroll-behavior-x: contain; }
+        .studysync-dock { max-width: calc(100vw - 24px); overflow: visible; scrollbar-width: none; }
         .studysync-dock > div { flex-shrink: 0; }
         .studysync-panel { overscroll-behavior: contain; }
         @media (max-width: 768px) {
@@ -2611,19 +2647,33 @@ export default function App() {
 
           /* Keep the bottom toolbar inside the safe area and make it horizontally scrollable. */
           .studysync-dock {
-            left: max(8px, env(safe-area-inset-left));
-            right: max(8px, env(safe-area-inset-right));
+            left: 50%;
+            right: auto;
             bottom: max(8px, env(safe-area-inset-bottom));
-            transform: none;
-            max-width: none;
-            width: auto;
-            padding: 6px 8px;
+            transform: translateX(-50%);
+            width: min(calc(100vw - 16px), 720px);
+            max-width: calc(100vw - 16px);
+            max-height: min(31dvh, 250px);
+            padding: 7px 8px;
             border-radius: 16px;
-            gap: 8px;
-            justify-content: flex-start;
+            gap: 7px;
+            justify-content: center;
+            align-content: center;
+            flex-wrap: wrap;
+            overflow-x: hidden;
+            overflow-y: auto;
+            overscroll-behavior: contain;
             -webkit-overflow-scrolling: touch;
+            touch-action: pan-y;
           }
           .studysync-dock > div { flex-shrink: 0; }
+          .studysync-dock > .h-6 { display: none; }
+          .studysync-dock > div:first-child {
+            display: flex;
+            align-items: center;
+          }
+          .studysync-dock > div:first-child span { min-width: 42px; text-align: center; }
+          .studysync-dock button { flex: 0 0 auto; }
 
           /* Every popup fits the phone width and remains independently scrollable. */
           .studysync-panel {
@@ -3108,28 +3158,115 @@ export default function App() {
       )}
 
       {/* INFINITE EXPANDING CANVAS VIEWPORT */}
-      <div ref={viewportRef} className="absolute inset-0 w-screen h-[100dvh] overflow-hidden pt-14 cursor-crosshair z-0" style={{ touchAction: 'none' }}>
+      <div ref={viewportRef} className="absolute inset-0 w-screen h-[100dvh] overflow-hidden pt-14 cursor-crosshair z-0 studysync-board-wrap" style={{ touchAction: 'none' }}>
         <div style={{ transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`, transformOrigin: 'top left', width: `${CANVAS_WIDTH}px`, height: `${CANVAS_HEIGHT}px` }} className="relative top-0 left-0">
           <canvas ref={bgCanvasRef} className="absolute top-0 left-0 pointer-events-none z-0 shadow-sm" />
           <canvas
             ref={drawCanvasRef}
             onPointerDown={(e) => {
-              // Do not let the browser pan/zoom/scroll the page while drawing.
               e.preventDefault();
+
+              if (e.pointerType === 'touch') {
+                activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+                if (activeTouchPointersRef.current.size >= 2) {
+                  // A second finger always switches from drawing to navigation.
+                  suppressTouchDrawingRef.current = true;
+                  if (isDrawingRef.current || isDraggingElementRef.current) {
+                    isDrawingRef.current = false;
+                    isDraggingElementRef.current = false;
+                    setIsDrawing(false);
+                    redrawCanvas();
+                  }
+
+                  const pts = Array.from(activeTouchPointersRef.current.values()).slice(0, 2);
+                  const dx = pts[1].x - pts[0].x;
+                  const dy = pts[1].y - pts[0].y;
+                  const distance = Math.max(1, Math.hypot(dx, dy));
+                  const center = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+                  const canvas = drawCanvasRef.current;
+                  const rect = canvas?.getBoundingClientRect();
+                  const currentScale = zoomScaleRef.current;
+                  const currentPan = panOffsetRef.current;
+                  const originX = rect ? rect.left - currentPan.x : 0;
+                  const originY = rect ? rect.top - currentPan.y : 0;
+                  const focalWorld = {
+                    x: rect ? (center.x - rect.left) / currentScale : 0,
+                    y: rect ? (center.y - rect.top) / currentScale : 0,
+                  };
+
+                  pinchGestureRef.current = {
+                    startDistance: distance,
+                    startScale: currentScale,
+                    startOrigin: { x: originX, y: originY },
+                    focalWorld,
+                  };
+                  e.currentTarget.setPointerCapture?.(e.pointerId);
+                  return;
+                }
+
+                if (suppressTouchDrawingRef.current) return;
+              }
+
               e.currentTarget.setPointerCapture?.(e.pointerId);
               handleMouseDown(e);
             }}
             onPointerMove={(e) => {
               e.preventDefault();
+
+              if (e.pointerType === 'touch') {
+                const active = activeTouchPointersRef.current;
+                if (active.has(e.pointerId)) active.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+                if (pinchGestureRef.current && active.size >= 2) {
+                  const pts = Array.from(active.values()).slice(0, 2);
+                  const dx = pts[1].x - pts[0].x;
+                  const dy = pts[1].y - pts[0].y;
+                  const distance = Math.max(1, Math.hypot(dx, dy));
+                  const center = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+                  const gesture = pinchGestureRef.current;
+                  const nextScale = Math.max(0.5, Math.min(2.5, Number((gesture.startScale * (distance / gesture.startDistance)).toFixed(2))));
+                  const nextPan = {
+                    x: center.x - gesture.startOrigin.x - gesture.focalWorld.x * nextScale,
+                    y: center.y - gesture.startOrigin.y - gesture.focalWorld.y * nextScale,
+                  };
+                  zoomScaleRef.current = nextScale;
+                  panOffsetRef.current = nextPan;
+                  setZoomScale(nextScale);
+                  setPanOffset(nextPan);
+                  return;
+                }
+
+                if (suppressTouchDrawingRef.current) return;
+              }
+
               handleMouseMove(e);
             }}
             onPointerUp={(e) => {
               e.preventDefault();
+              if (e.pointerType === 'touch') {
+                activeTouchPointersRef.current.delete(e.pointerId);
+                e.currentTarget.releasePointerCapture?.(e.pointerId);
+                if (activeTouchPointersRef.current.size < 2) pinchGestureRef.current = null;
+                if (activeTouchPointersRef.current.size === 0) suppressTouchDrawingRef.current = false;
+                // Never turn a two-finger navigation gesture into a stroke on release.
+                if (suppressTouchDrawingRef.current) return;
+              }
               e.currentTarget.releasePointerCapture?.(e.pointerId);
               handleMouseUp(e);
             }}
             onPointerCancel={(e) => {
               e.preventDefault();
+              if (e.pointerType === 'touch') {
+                activeTouchPointersRef.current.delete(e.pointerId);
+                pinchGestureRef.current = null;
+                e.currentTarget.releasePointerCapture?.(e.pointerId);
+                if (activeTouchPointersRef.current.size === 0) suppressTouchDrawingRef.current = false;
+                isDrawingRef.current = false;
+                setIsDrawing(false);
+                redrawCanvas();
+                return;
+              }
               e.currentTarget.releasePointerCapture?.(e.pointerId);
               handleMouseUp(e);
             }}
