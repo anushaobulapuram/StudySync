@@ -1,3 +1,4 @@
+/* STUDYSYNC_SYNC_FINAL - drawing sync / permission / host handoff build */
 import React, { useRef, useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
 import AuthRoomModal from './AuthRoomModal';
@@ -10,12 +11,25 @@ export default function App() {
   const laserCtxRef = useRef(null);
   const fileInputRef = useRef(null);
   const channelRef = useRef(null);
+  const channelReadyRef = useRef(false);
+  const boardOutboxRef = useRef([]);
+  const isHostRef = useRef(false);
+  const isCoHostRef = useRef(false);
+  const permissionsRef = useRef({});
+  const userPermissionsRef = useRef({});
+  const toolRef = useRef('pencil');
+  const colorRef = useRef('#2563eb');
+  const lineWidthRef = useRef(3);
+  const isDrawingRef = useRef(false);
   const viewportRef = useRef(null);
 
-  // Audio / WebRTC Refs
+  // Audio / WebRTC Multi-Peer Mesh Refs
   const localStreamRef = useRef(null);
-  const peerConnectionRef = useRef(null);
-  const remoteAudioRef = useRef(null);
+  const peerConnectionsRef = useRef({}); // peerId -> RTCPeerConnection
+  const remoteAudiosRef = useRef({}); // peerId -> HTMLAudioElement
+  const pendingCandidatesRef = useRef({}); // peerId -> ICE candidates received before remoteDescription
+  const makingOfferRef = useRef({}); // peerId -> offer in progress
+  const myClientId = useRef('user-' + Math.random().toString(36).substring(2, 9) + '-' + Date.now().toString(36).substring(4)).current;
 
   // Screen Recording
   const mediaRecorderRef = useRef(null);
@@ -32,9 +46,17 @@ export default function App() {
   const [userName, setUserName] = useState('');
   const [roomId, setRoomId] = useState('');
   const [isHost, setIsHost] = useState(false);
+  const [isCoHost, setIsCoHost] = useState(false); // Co-host state
+  const [coHostIds, setCoHostIds] = useState([]); // List of co-host clientIds
   const [initialUrlRoom, setInitialUrlRoom] = useState('');
   const [showPermissionsModal, setShowPermissionsModal] = useState(false);
+  const [activeTabPermissions, setActiveTabPermissions] = useState('global'); // 'global' | 'participants'
   const [copiedLink, setCopiedLink] = useState(false);
+  const [showHostLeaveModal, setShowHostLeaveModal] = useState(false);
+  const [selectedHostSuccessor, setSelectedHostSuccessor] = useState('');
+
+  // Participants & Presence
+  const [participants, setParticipants] = useState([]);
 
   // In-App Slides Gallery
   const [savedSlides, setSavedSlides] = useState([]);
@@ -47,12 +69,27 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const chatBottomRef = useRef(null);
 
-  // Host Permissions
+  // Host Permissions (Global Defaults)
   const [permissions, setPermissions] = useState({
-    canDraw: true,
+    canDraw: false,
+    canText: false,
+    canUpload: false,
+    canVoiceChat: true,
     canSharePointer: true,
     syncZoomGlobally: true,
   });
+
+  // Client Individual Permissions (host can override these per participant)
+  const [userPermissions, setUserPermissions] = useState({
+    canDraw: null,
+    canText: null,
+    canUpload: null,
+    canVoice: null,
+    canSharePointer: null,
+  });
+
+  // Host's Map of Per-Participant Overrides
+  const [participantOverrides, setParticipantOverrides] = useState({});
 
   // Tools: 'select' | 'pencil' | 'highlighter' | 'smart' | 'laser' | 'sticky' | 'eraser' | 'text' | 'extract' | shapes
   const [tool, setTool] = useState('pencil');
@@ -63,9 +100,50 @@ export default function App() {
   // Magic / Laser Points & Fade Loop (1.5 seconds lifespan)
   const laserPointsRef = useRef([]);
 
-  // Dynamic Object Canvas Engine for Move / Drag Feature
+  // Dynamic Object Canvas Engine for Move / Drag Feature (by element ID)
   const elementsRef = useRef([]);
-  const [selectedElementIndex, setSelectedElementIndex] = useState(null);
+  const [selectedElementId, setSelectedElementId] = useState(null);
+
+  const makeElementId = (kind = 'element') =>
+    `${myClientId}-${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  const mergeRemoteElements = (incoming = []) => {
+    if (!Array.isArray(incoming) || incoming.length === 0) return;
+    const byId = new Map(elementsRef.current.map((el) => [String(el.id), el]));
+    incoming.forEach((incomingEl) => {
+      if (!incomingEl || incomingEl.id === undefined || incomingEl.id === null) return;
+      const id = String(incomingEl.id);
+      const current = byId.get(id);
+      const incomingTime = Number(incomingEl.updatedAt || incomingEl.createdAt || 0);
+      const currentTime = Number(current?.updatedAt || current?.createdAt || 0);
+      if (!current || incomingTime >= currentTime) byId.set(id, incomingEl);
+    });
+    elementsRef.current = Array.from(byId.values());
+    redrawCanvas();
+  };
+
+  const safeBroadcast = async (event, payload, { queue = false } = {}) => {
+    const channel = channelRef.current;
+    if (!channel || !channelReadyRef.current) {
+      if (queue) boardOutboxRef.current.push({ event, payload });
+      return false;
+    }
+    try {
+      const status = await channel.send({ type: 'broadcast', event, payload });
+      if (status !== 'ok') console.warn(`StudySync broadcast ${event} status:`, status);
+      return status === 'ok';
+    } catch (err) {
+      console.warn(`StudySync broadcast ${event} failed:`, err);
+      if (queue) boardOutboxRef.current.push({ event, payload });
+      return false;
+    }
+  };
+
+  const flushBoardOutbox = async () => {
+    const pending = [...boardOutboxRef.current];
+    boardOutboxRef.current = [];
+    for (const item of pending) await safeBroadcast(item.event, item.payload, { queue: true });
+  };
   const dragStartPosRef = useRef({ x: 0, y: 0 });
   const isDraggingElementRef = useRef(false);
 
@@ -79,9 +157,10 @@ export default function App() {
   const panOffsetRef = useRef({ x: 0, y: 0 });
   const zoomScaleRef = useRef(1);
 
-  // Quick Notes State
+  // Strict Private Notes State (100% private, never broadcasted, persistent)
   const [showNotesPad, setShowNotesPad] = useState(false);
-  const [sharedNotes, setSharedNotes] = useState('');
+  const [privateNotes, setPrivateNotes] = useState('');
+  const [notesSaveStatus, setNotesSaveStatus] = useState('Saved');
   const [copySuccess, setCopySuccess] = useState(false);
 
   // OCR State
@@ -94,7 +173,7 @@ export default function App() {
 
   // Pointer State
   const [shareMyPointer, setShareMyPointer] = useState(true);
-  const [remoteCursor, setRemoteCursor] = useState({ x: -100, y: -100, visible: false, name: 'Guest' });
+  const [remoteCursors, setRemoteCursors] = useState({});
 
   // Voice State
   const [isMicOn, setIsMicOn] = useState(false);
@@ -119,10 +198,32 @@ export default function App() {
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   };
 
-  const paletteColors = [
-    '#0f172a', '#2563eb', '#7c3aed', '#db2777', 
-    '#ea580c', '#16a34a', '#0284c7', '#eab308'
+  // Office / Word Style Color Matrices
+  const themePalette = [
+    ['#ffffff', '#000000', '#eeece1', '#1f497d', '#4f81bd', '#c0504d', '#9bbb59', '#8064a2', '#4bacc6', '#f79646'],
+    ['#f2f2f2', '#7f7f7f', '#ddd9c3', '#c6d9f0', '#dce6f1', '#f2dcdb', '#ebf1dd', '#e5e0ec', '#dbeef3', '#fdeada'],
+    ['#d8d8d8', '#595959', '#c4bd97', '#8db3e2', '#b8cce4', '#e5b9b7', '#d7e3bc', '#ccc1d9', '#b7dde8', '#fbd5b5'],
+    ['#bfbfbf', '#3f3f3f', '#948a54', '#548dd4', '#95b3d7', '#d99694', '#c3d69b', '#b2a2c7', '#92cddc', '#fac08f'],
+    ['#a5a5a5', '#262626', '#494429', '#17365d', '#366092', '#953734', '#76933c', '#5f497a', '#31859b', '#e36c09'],
+    ['#7f7f7f', '#0c0c0c', '#1d1b10', '#0f243e', '#244061', '#632423', '#4f6128', '#3f3151', '#205867', '#974806'],
   ];
+
+  const standardColors = [
+    '#c00000', '#ff0000', '#ffc000', '#ffff00', '#92d050',
+    '#00b050', '#00b0f0', '#0070c0', '#002060', '#7030a0',
+  ];
+
+  const [recentColors, setRecentColors] = useState([
+    '#2563eb', '#0f172a', '#ea580c', '#16a34a', '#db2777', '#7c3aed',
+  ]);
+
+  const selectColor = (newColor) => {
+    setColor(newColor);
+    setRecentColors((prev) => {
+      const filtered = prev.filter((c) => c.toLowerCase() !== newColor.toLowerCase());
+      return [newColor, ...filtered].slice(0, 10);
+    });
+  };
 
   useEffect(() => {
     panOffsetRef.current = panOffset;
@@ -132,6 +233,15 @@ export default function App() {
     zoomScaleRef.current = zoomScale;
   }, [zoomScale]);
 
+  useEffect(() => { isHostRef.current = isHost; }, [isHost]);
+  useEffect(() => { isCoHostRef.current = isCoHost; }, [isCoHost]);
+  useEffect(() => { permissionsRef.current = permissions; }, [permissions]);
+  useEffect(() => { userPermissionsRef.current = userPermissions; }, [userPermissions]);
+  useEffect(() => { toolRef.current = tool; }, [tool]);
+  useEffect(() => { colorRef.current = color; }, [color]);
+  useEffect(() => { lineWidthRef.current = lineWidth; }, [lineWidth]);
+  useEffect(() => { isDrawingRef.current = isDrawing; }, [isDrawing]);
+
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const existingRoom = urlParams.get('room');
@@ -140,15 +250,179 @@ export default function App() {
     }
   }, []);
 
-  const handleLaunchSession = ({ roomId: targetRoom, isHost: hostStatus, userName: name, settings }) => {
-    setRoomId(targetRoom);
-    setIsHost(hostStatus);
-    setUserName(name);
-    if (settings && hostStatus) {
-      setPermissions((prev) => ({ ...prev, ...settings }));
+  const handleLaunchSession = async ({ roomId: targetRoom, isHost: hostStatus, userName: name, settings }) => {
+    const cleanId = String(targetRoom || '').trim().toLowerCase();
+    const fullCode = cleanId.startsWith('studysync-') ? cleanId : `studysync-${cleanId}`;
+
+    try {
+      if (!hostStatus) {
+        // Guest must join the exact room created by the host.
+        const { data, error } = await supabase
+          .from('study_rooms')
+          .select('room_id, permissions')
+          .eq('room_id', fullCode)
+          .maybeSingle();
+
+        if (error || !data) {
+          alert(`Room "${cleanId}" does not exist. Ask the host for the correct room code.`);
+          return;
+        }
+
+        setPermissions((prev) => ({
+          ...prev,
+          ...(data.permissions || {}),
+        }));
+      } else if (settings) {
+        setPermissions((prev) => ({ ...prev, ...settings }));
+      }
+
+      // Every room starts from a clean client-side workspace. Nothing from
+      // the previous room is allowed to leak into the new room.
+      elementsRef.current = [];
+      laserPointsRef.current = [];
+      boardOutboxRef.current = [];
+      currentStrokeRef.current = [];
+      setStickyNotes([]);
+      setMessages([]);
+      setSavedSlides([]);
+      setHasDocument(false);
+      setShowSlidesDrawer(false);
+      setShowChatPad(false);
+      setTextInput({ visible: false, x: 0, y: 0, text: '' });
+      setSelectedElementId(null);
+      setZoomScale(1);
+      setPanOffset({ x: 0, y: 0 });
+      panOffsetRef.current = { x: 0, y: 0 };
+      zoomScaleRef.current = 1;
+
+      setRoomId(fullCode);
+      setIsHost(Boolean(hostStatus));
+      setIsCoHost(false);
+      setUserName(name);
+      setUserPermissions({
+        canDraw: null,
+        canText: null,
+        canUpload: null,
+        canVoice: null,
+        canSharePointer: null,
+      });
+      setIsSessionActive(true);
+      window.history.replaceState({}, '', `?room=${encodeURIComponent(fullCode)}&host=${Boolean(hostStatus)}`);
+    } catch (err) {
+      console.error('Session launch error:', err);
+      alert('Unable to start the session. Please try again.');
     }
-    setIsSessionActive(true);
-    window.history.replaceState({}, '', `?room=${targetRoom}&host=${hostStatus}`);
+  };
+
+  const completeHostHandoffAndLeave = async (targetClientId) => {
+    if (!isHostRef.current || !targetClientId) return;
+    const target = participants.find((p) => p.clientId === targetClientId);
+    if (!target) return;
+
+    const sent = await safeBroadcast('host-transfer', { newHostId: targetClientId });
+    if (!sent) {
+      alert('Could not transfer host right now. Please check the room connection and try again.');
+      return;
+    }
+
+    // Give the selected participant a moment to receive the transfer before
+    // this client leaves the realtime channel.
+    setIsHost(false);
+    isHostRef.current = false;
+    setIsCoHost(false);
+    isCoHostRef.current = false;
+    setCoHostIds([]);
+    setShowHostLeaveModal(false);
+    setSelectedHostSuccessor('');
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await handleLeaveOrDisableRoom(true);
+  };
+
+  const handleLeaveOrDisableRoom = async (skipPrompt = false) => {
+    if (!skipPrompt && isHostRef.current && participants.length > 1) {
+      setSelectedHostSuccessor('');
+      setShowHostLeaveModal(true);
+      return;
+    }
+    const isOnlyOne = participants.length <= 1;
+    const confirmMsg = isOnlyOne && (isHost || isCoHost)
+      ? 'Are you sure you want to disable/delete this room?'
+      : 'Are you sure you want to leave this session?';
+
+    const confirmAction = skipPrompt ? true : window.confirm(confirmMsg);
+    if (!confirmAction) return;
+
+    // 1. Stop local audio stream
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+    }
+    setIsMicOn(false);
+    setIsVoiceConnected(false);
+
+    // 2. Stop screen recording if running
+    if (isRecording && mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+
+    // 3. Close all peer connections
+    Object.values(peerConnectionsRef.current).forEach((pc) => pc.close());
+    peerConnectionsRef.current = {};
+
+    // 4. Clean up remote audio elements
+    Object.values(remoteAudiosRef.current).forEach((a) => {
+      a.srcObject = null;
+      try { a.remove(); } catch (err) {}
+    });
+    remoteAudiosRef.current = {};
+    pendingCandidatesRef.current = {};
+    makingOfferRef.current = {};
+
+    // 5. Delete room from database if last person left or host/co-host chose to disable
+    try {
+      if (participants.length <= 1) {
+        const fullCode = roomId.trim().toLowerCase();
+
+        // Delete child room data first, then the room itself.
+        // This avoids FK/RLS ordering problems and guarantees that private
+        // notes cannot survive a deleted room.
+        await supabase.from('private_notes').delete().eq('room_id', fullCode);
+        await supabase.from('study_rooms').delete().eq('room_id', fullCode);
+      }
+    } catch (e) {
+      console.warn('Deleting room error:', e);
+    }
+
+    // 6. Untrack presence & remove channel
+    if (channelRef.current) {
+      try {
+        await channelRef.current.untrack();
+      } catch (e) {}
+      supabase.removeChannel(channelRef.current);
+      channelRef.current = null;
+    }
+
+    // 7. Reset session state
+    elementsRef.current = [];
+    laserPointsRef.current = [];
+    currentStrokeRef.current = [];
+    setStickyNotes([]);
+    setMessages([]);
+    setSavedSlides([]);
+    setHasDocument(false);
+    setSelectedElementId(null);
+    setTextInput({ visible: false, x: 0, y: 0, text: '' });
+    setZoomScale(1);
+    setPanOffset({ x: 0, y: 0 });
+    panOffsetRef.current = { x: 0, y: 0 };
+    zoomScaleRef.current = 1;
+    setParticipants([]);
+    setRemoteCursors({});
+    setIsSessionActive(false);
+    setIsCoHost(false);
+    setCoHostIds([]);
+    setRoomId('');
+    window.history.replaceState({}, '', window.location.pathname);
   };
 
   const CANVAS_WIDTH = 4000;
@@ -176,6 +450,7 @@ export default function App() {
     const drawCtx = drawCanvas.getContext('2d', { willReadFrequently: true });
     drawCtx.lineCap = 'round';
     drawCtx.lineJoin = 'round';
+    drawCtx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
     drawCtxRef.current = drawCtx;
 
     const laserCtx = laserCanvas.getContext('2d');
@@ -184,23 +459,177 @@ export default function App() {
     laserCtxRef.current = laserCtx;
 
     const channel = supabase.channel(`room-${roomId}`, {
-      config: { broadcast: { self: false } },
+      config: {
+        broadcast: { self: false },
+        presence: { key: myClientId },
+      },
     });
 
     channel
+      .on('presence', { event: 'sync' }, () => {
+        const state = channel.presenceState();
+        const activeList = [];
+        Object.keys(state).forEach((key) => {
+          const presences = state[key];
+          if (presences && presences.length > 0) {
+            activeList.push(presences[0]);
+          }
+        });
+        setParticipants(activeList);
+        if (!isHostRef.current) {
+          safeBroadcast('board-request', { from: myClientId });
+        }
+      })
+      .on('presence', { event: 'join' }, ({ key }) => {
+        if (key !== myClientId && isHostRef.current) {
+          safeBroadcast('board-state', { to: key, elements: elementsRef.current });
+        }
+        if (
+          key !== myClientId &&
+          localStreamRef.current?.getAudioTracks()?.[0]?.enabled &&
+          myClientId < key
+        ) {
+          negotiateWithPeer(key);
+        }
+      })
+      .on('presence', { event: 'leave' }, ({ key }) => {
+        setRemoteCursors((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+        if (peerConnectionsRef.current[key]) {
+          peerConnectionsRef.current[key].close();
+          delete peerConnectionsRef.current[key];
+        }
+        if (remoteAudiosRef.current[key]) {
+          remoteAudiosRef.current[key].srcObject = null;
+          delete remoteAudiosRef.current[key];
+        }
+
+        const state = channel.presenceState();
+        const activeList = [];
+        Object.keys(state).forEach((k) => {
+          if (k !== key && state[k]?.length > 0) {
+            activeList.push(state[k][0]);
+          }
+        });
+        setParticipants(activeList);
+      })
+      // IMPORTANT: drawings are merged by element ID. Replacing the whole
+      // array caused one user's drawing to overwrite another user's drawing.
+      .on('broadcast', { event: 'board-add' }, ({ payload }) => {
+        if (payload?.element) mergeRemoteElements([payload.element]);
+      })
+      .on('broadcast', { event: 'board-update' }, ({ payload }) => {
+        if (payload?.element) mergeRemoteElements([payload.element]);
+      })
+      .on('broadcast', { event: 'add-element' }, ({ payload }) => {
+        if (payload?.element) mergeRemoteElements([payload.element]);
+      })
+      .on('broadcast', { event: 'board-request' }, ({ payload }) => {
+        if (!isHostRef.current || !payload?.from || payload.from === myClientId) return;
+        safeBroadcast('board-state', { to: payload.from, elements: elementsRef.current });
+      })
+      .on('broadcast', { event: 'elements-snapshot-request' }, ({ payload }) => {
+        if (!isHostRef.current || !payload?.from || payload.from === myClientId) return;
+        safeBroadcast('board-state', { to: payload.from, elements: elementsRef.current });
+      })
+      .on('broadcast', { event: 'board-state' }, ({ payload }) => {
+        if (payload?.to && payload.to !== myClientId) return;
+        mergeRemoteElements(payload?.elements || []);
+      })
+      .on('broadcast', { event: 'elements-snapshot' }, ({ payload }) => {
+        if (payload?.to && payload.to !== myClientId) return;
+        mergeRemoteElements(payload?.elements || []);
+      })
+      // Compatibility with an older tab still using sync-elements.
       .on('broadcast', { event: 'sync-elements' }, ({ payload }) => {
-        elementsRef.current = payload.elements;
-        redrawCanvas();
+        mergeRemoteElements(payload?.elements || []);
       })
       .on('broadcast', { event: 'draw-laser' }, ({ payload }) => addLaserPoint(payload.x, payload.y))
       .on('broadcast', { event: 'chat-message' }, ({ payload }) => setMessages((prev) => [...prev, payload]))
       .on('broadcast', { event: 'sync-stickies' }, ({ payload }) => setStickyNotes(payload.stickies))
+      .on('broadcast', { event: 'board-clear' }, () => {
+        elementsRef.current = [];
+        redrawCanvas();
+      })
       .on('broadcast', { event: 'clear-board' }, () => {
         elementsRef.current = [];
         redrawCanvas();
       })
-      .on('broadcast', { event: 'cursor-move' }, ({ payload }) => setRemoteCursor(payload))
-      .on('broadcast', { event: 'permissions-update' }, ({ payload }) => setPermissions(payload))
+      .on('broadcast', { event: 'cursor-move' }, ({ payload }) => {
+        if (!payload?.clientId || payload.clientId === myClientId) return;
+        setRemoteCursors((prev) => ({ ...prev, [payload.clientId]: payload }));
+      })
+      .on('broadcast', { event: 'permissions-update' }, ({ payload }) => {
+        const next = { ...permissionsRef.current, ...(payload || {}) };
+        permissionsRef.current = next;
+        setPermissions(next);
+        if (next.canVoiceChat === false && localStreamRef.current) {
+          localStreamRef.current.getTracks().forEach((track) => { track.enabled = false; });
+          setIsMicOn(false);
+          setIsVoiceConnected(false);
+        }
+      })
+      .on('broadcast', { event: 'individual-permission-update' }, ({ payload }) => {
+        if (payload?.targetClientId !== myClientId) return;
+        const next = {
+          canDraw: null,
+          canText: null,
+          canUpload: null,
+          canVoice: null,
+          ...(payload.permissions || {}),
+        };
+        setUserPermissions(next);
+        if (next.canVoice === false && localStreamRef.current) {
+          localStreamRef.current.getTracks().forEach((track) => { track.enabled = false; });
+          setIsMicOn(false);
+          setIsVoiceConnected(false);
+        }
+      })
+      .on('broadcast', { event: 'cohost-update' }, ({ payload }) => {
+        setCoHostIds(payload.coHostIds || []);
+        if (payload.coHostIds?.includes(myClientId)) {
+          setIsCoHost(true);
+        } else {
+          setIsCoHost(false);
+        }
+      })
+      .on('broadcast', { event: 'kick-participant' }, ({ payload }) => {
+        if (payload?.targetClientId !== myClientId) return;
+        alert('You were removed from this room by the host.');
+        setIsSessionActive(false);
+        setIsMicOn(false);
+        setIsVoiceConnected(false);
+        setRoomId('');
+        setParticipants([]);
+        setIsCoHost(false);
+        setCoHostIds([]);
+        window.history.replaceState({}, '', window.location.pathname);
+      })
+      .on('broadcast', { event: 'host-transfer' }, ({ payload }) => {
+        const newHostId = payload?.newHostId;
+        if (!newHostId) return;
+        const becomingHost = newHostId === myClientId;
+        setIsHost(becomingHost);
+        isHostRef.current = becomingHost;
+        setIsCoHost(false);
+        isCoHostRef.current = false;
+        if (newHostId === myClientId) {
+          setUserPermissions((prev) => { const next = { ...prev, canDraw: true, canText: true, canUpload: true, canVoice: true, canSharePointer: true }; userPermissionsRef.current = next; return next; });
+          setTimeout(() => {
+            channelRef.current?.track({
+              clientId: myClientId,
+              userName,
+              isHost: true,
+              isCoHost: false,
+              isMicOn,
+              joinedAt: new Date().toISOString(),
+            });
+          }, 50);
+        }
+      })
       .on('broadcast', { event: 'sync-view' }, ({ payload }) => {
         if (payload.scale !== undefined) setZoomScale(payload.scale);
         if (payload.pan !== undefined) setPanOffset(payload.pan);
@@ -211,41 +640,104 @@ export default function App() {
         if (payload.total) setNumPages(payload.total);
       })
       .on('broadcast', { event: 'delete-doc' }, () => resetBackgroundCanvas(false))
-      .on('broadcast', { event: 'sync-notes' }, ({ payload }) => setSharedNotes(payload.text))
-      .on('broadcast', { event: 'webrtc-offer' }, async ({ payload }) => handleReceiveOffer(payload.offer))
+      .on('broadcast', { event: 'webrtc-renegotiate-request' }, ({ payload }) => {
+        const fromPeerId = payload?.from;
+        if (!fromPeerId || fromPeerId === myClientId) return;
+        if (myClientId < fromPeerId && localStreamRef.current?.getAudioTracks()?.[0]?.enabled) {
+          negotiateWithPeer(fromPeerId);
+        }
+      })
+      .on('broadcast', { event: 'webrtc-offer' }, async ({ payload }) => {
+        if (payload.to !== myClientId) return;
+        handleReceiveOffer(payload.from, payload.offer);
+      })
       .on('broadcast', { event: 'webrtc-answer' }, async ({ payload }) => {
-        if (peerConnectionRef.current) {
-          await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.answer));
+        if (payload.to !== myClientId) return;
+        const pc = peerConnectionsRef.current[payload.from];
+        if (!pc) return;
+
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
+          await flushPendingCandidates(payload.from, pc);
+        } catch (err) {
+          console.warn('WebRTC answer error:', err);
         }
       })
       .on('broadcast', { event: 'webrtc-candidate' }, async ({ payload }) => {
-        if (peerConnectionRef.current && payload.candidate) {
-          try {
-            await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(payload.candidate));
-          } catch (e) {
-            console.error(e);
+        if (payload.to !== myClientId || !payload.candidate) return;
+
+        const pc = peerConnectionsRef.current[payload.from] || createPeerConnection(payload.from);
+
+        try {
+          if (pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+          } else {
+            pendingCandidatesRef.current[payload.from] =
+              pendingCandidatesRef.current[payload.from] || [];
+            pendingCandidatesRef.current[payload.from].push(payload.candidate);
           }
+        } catch (err) {
+          console.warn('ICE candidate error:', err);
         }
       })
-      .subscribe();
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          channelReadyRef.current = true;
+          await channel.track({
+            clientId: myClientId,
+            userName: userName || (isHost ? 'Host' : 'Guest'),
+            isHost,
+            isCoHost,
+            isMicOn: Boolean(localStreamRef.current?.getAudioTracks()?.[0]?.enabled),
+            joinedAt: new Date().toISOString(),
+            permissions: userPermissions,
+          });
+
+          await flushBoardOutbox();
+          if (!isHostRef.current) {
+            setTimeout(() => safeBroadcast('board-request', { from: myClientId }), 150);
+          }
+
+          // Presence sync can contain peers that joined before this client.
+          // The smaller client ID is the sole offer initiator.
+          if (localStreamRef.current?.getAudioTracks()?.[0]?.enabled) {
+            const state = channel.presenceState();
+            Object.keys(state).forEach((peerId) => {
+              if (peerId !== myClientId && myClientId < peerId) {
+                negotiateWithPeer(peerId);
+              }
+            });
+          }
+        }
+      });
 
     channelRef.current = channel;
 
     return () => {
+      channelReadyRef.current = false;
+      if (channelRef.current === channel) channelRef.current = null;
       supabase.removeChannel(channel);
-      if (localStreamRef.current) localStreamRef.current.getTracks().forEach((track) => track.stop());
-      if (peerConnectionRef.current) peerConnectionRef.current.close();
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => track.stop());
+      }
+      Object.values(peerConnectionsRef.current).forEach((pc) => pc.close());
+      peerConnectionsRef.current = {};
+      Object.values(remoteAudiosRef.current).forEach((a) => {
+        a.srcObject = null;
+        try { a.remove(); } catch (err) {}
+      });
+      remoteAudiosRef.current = {};
+      pendingCandidatesRef.current = {};
+      makingOfferRef.current = {};
       if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
     };
   }, [isSessionActive, roomId]);
 
-  // =========================================================================
-  // 1.5 SECONDS MAGIC / LASER PEN FADE ANIMATION LOOP
-  // =========================================================================
+  // Laser Pen Animation Loop
   useEffect(() => {
     if (!isSessionActive) return;
     let animId;
-    const LASER_LIFESPAN = 1500; // Exact 1.5 seconds
+    const LASER_LIFESPAN = 1500;
 
     const renderLaser = () => {
       const ctx = laserCtxRef.current;
@@ -255,7 +747,6 @@ export default function App() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       const now = Date.now();
 
-      // Remove points older than 1.5s
       laserPointsRef.current = laserPointsRef.current.filter((p) => now - p.time < LASER_LIFESPAN);
 
       const pts = laserPointsRef.current;
@@ -291,9 +782,6 @@ export default function App() {
     laserPointsRef.current.push({ x, y, time: Date.now(), isStart });
   };
 
-  // =========================================================================
-  // MOVE / DRAG SELECTION BOUNDS & ENGINE
-  // =========================================================================
   const redrawCanvas = () => {
     const ctx = drawCtxRef.current;
     const canvas = drawCanvasRef.current;
@@ -301,7 +789,7 @@ export default function App() {
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    elementsRef.current.forEach((el, index) => {
+    elementsRef.current.forEach((el) => {
       ctx.save();
       if (el.isHighlighter) {
         ctx.globalCompositeOperation = 'source-over';
@@ -318,6 +806,7 @@ export default function App() {
         ctx.strokeStyle = el.color;
         ctx.fillStyle = el.color;
         ctx.lineWidth = el.width;
+        ctx.lineCap = 'round';
       }
 
       if (el.type === 'stroke' && el.points && el.points.length > 1) {
@@ -335,26 +824,33 @@ export default function App() {
         ctx.fillText(el.text, el.x, el.y);
       }
 
-      // Visual Bounding Box when selected
-      if (tool === 'select' && selectedElementIndex === index) {
+      if (toolRef.current === 'select' && selectedElementId === el.id) {
         const bounds = getElementBounds(el);
         ctx.restore();
         ctx.save();
         ctx.strokeStyle = '#2563eb';
         ctx.lineWidth = 2;
         ctx.setLineDash([6, 6]);
-        ctx.strokeRect(bounds.minX - 6, bounds.minY - 6, bounds.width + 12, bounds.height + 12);
+        ctx.strokeRect(bounds.minX, bounds.minY, bounds.width, bounds.height);
       }
       ctx.restore();
     });
   };
 
+  const broadcastElement = (element) => {
+    if (!element) return;
+    safeBroadcast('board-add', { element }, { queue: true });
+  };
+
+  const broadcastUpdatedElement = (element) => {
+    if (!element) return;
+    safeBroadcast('board-update', { element }, { queue: true });
+  };
+
   const broadcastAllElements = () => {
-    channelRef.current?.send({
-      type: 'broadcast',
-      event: 'sync-elements',
-      payload: { elements: elementsRef.current },
-    });
+    // Kept only for compatibility with existing text/select actions.
+    // Normal drawing never sends a whole-board replacement anymore.
+    safeBroadcast('board-state', { to: null, elements: elementsRef.current });
   };
 
   const getElementBounds = (el) => {
@@ -368,29 +864,40 @@ export default function App() {
         maxY = Math.max(maxY, p.y);
       });
     } else if (el.type === 'shape') {
-      minX = Math.min(el.fromX, el.toX);
-      maxX = Math.max(el.fromX, el.toX);
-      minY = Math.min(el.fromY, el.toY);
-      maxY = Math.max(el.fromY, el.toY);
+      if (el.shapeTool === 'circle' || el.shapeTool === 'star') {
+        const radius = Math.hypot(el.toX - el.fromX, el.toY - el.fromY);
+        minX = el.fromX - radius;
+        maxX = el.fromX + radius;
+        minY = el.fromY - radius;
+        maxY = el.fromY + radius;
+      } else {
+        minX = Math.min(el.fromX, el.toX);
+        maxX = Math.max(el.fromX, el.toX);
+        minY = Math.min(el.fromY, el.toY);
+        maxY = Math.max(el.fromY, el.toY);
+      }
     } else if (el.type === 'text') {
       minX = el.x;
-      maxX = el.x + (el.fontSize * (el.text?.length || 1) * 0.6);
-      minY = el.y - el.fontSize;
-      maxY = el.y;
+      const charWidth = (el.fontSize || 24) * 0.62;
+      maxX = el.x + ((el.text?.length || 1) * charWidth);
+      minY = el.y - (el.fontSize || 24);
+      maxY = el.y + 6;
     }
 
-    return { minX, maxX, minY, maxY, width: Math.max(maxX - minX, 10), height: Math.max(maxY - minY, 10) };
+    const pad = Math.max((el.width || 4) / 2, 8);
+    return {
+      minX: minX - pad,
+      maxX: maxX + pad,
+      minY: minY - pad,
+      maxY: maxY + pad,
+      width: Math.max((maxX - minX) + pad * 2, 16),
+      height: Math.max((maxY - minY) + pad * 2, 16),
+    };
   };
 
   const isPointInsideElement = (x, y, el) => {
     const b = getElementBounds(el);
-    const padding = 18;
-    return (
-      x >= b.minX - padding &&
-      x <= b.maxX + padding &&
-      y >= b.minY - padding &&
-      y <= b.maxY + padding
-    );
+    return x >= b.minX && x <= b.maxX && y >= b.minY && y <= b.maxY;
   };
 
   const moveElementByDelta = (el, dx, dy) => {
@@ -407,7 +914,6 @@ export default function App() {
     }
   };
 
-  // Wheel Zoom & Pan
   useEffect(() => {
     if (!isSessionActive) return;
 
@@ -419,7 +925,7 @@ export default function App() {
         const newScale = Math.min(Math.max(Number((zoomScaleRef.current * zoomFactor).toFixed(2)), 0.3), 3.0);
         setZoomScale(newScale);
 
-        if (isHost && permissions.syncZoomGlobally) {
+        if ((isHost || isCoHost) && permissions.syncZoomGlobally) {
           channelRef.current?.send({
             type: 'broadcast',
             event: 'sync-view',
@@ -433,7 +939,7 @@ export default function App() {
         };
         setPanOffset(newPan);
 
-        if (isHost && permissions.syncZoomGlobally) {
+        if ((isHost || isCoHost) && permissions.syncZoomGlobally) {
           channelRef.current?.send({
             type: 'broadcast',
             event: 'sync-view',
@@ -450,9 +956,8 @@ export default function App() {
     return () => {
       if (viewport) viewport.removeEventListener('wheel', handleWheel);
     };
-  }, [isHost, permissions.syncZoomGlobally, isSessionActive]);
+  }, [isHost, isCoHost, permissions.syncZoomGlobally, isSessionActive]);
 
-  // Context properties
   useEffect(() => {
     if (!drawCtxRef.current) return;
     const ctx = drawCtxRef.current;
@@ -478,7 +983,6 @@ export default function App() {
     }
   }, [color, lineWidth, tool]);
 
-  // Screen Recorder
   const startRecording = async () => {
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
@@ -489,9 +993,7 @@ export default function App() {
       let audioStream;
       try {
         audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      } catch (err) {
-        console.warn('Mic unavailable');
-      }
+      } catch (err) {}
 
       const tracks = [...screenStream.getVideoTracks()];
       if (audioStream && audioStream.getAudioTracks().length > 0) {
@@ -504,9 +1006,7 @@ export default function App() {
       recordedChunksRef.current = [];
 
       const recorder = new MediaRecorder(combinedStream, {
-        mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-          ? 'video/webm;codecs=vp9'
-          : 'video/webm',
+        mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm',
       });
 
       recorder.ondataavailable = (e) => {
@@ -561,7 +1061,6 @@ export default function App() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Sticky Notes
   const addStickyNote = (x, y) => {
     const newSticky = {
       id: Date.now(),
@@ -596,155 +1095,155 @@ export default function App() {
     });
   };
 
-  // Google Handwriting & Shape Engine
-  const recognizeAndDrawSmartShape = async (points, ctx) => {
-    if (points.length < 5) return false;
-    const start = points[0];
-    const end = points[points.length - 1];
+  // Magic / Auto-correct Pen.
+  // The recognizer works from the complete freehand path, so the temporary
+  // preview is never used as the stored board state. It recognizes lines,
+  // arrows, circles, rectangles and triangles and otherwise keeps the exact
+  // freehand stroke.
+  const recognizeAndDrawSmartShape = (rawPoints) => {
+    if (!Array.isArray(rawPoints) || rawPoints.length < 6) return false;
 
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    points.forEach((p) => {
-      minX = Math.min(minX, p.x);
-      maxX = Math.max(maxX, p.x);
-      minY = Math.min(minY, p.y);
-      maxY = Math.max(maxY, p.y);
-    });
+    const points = rawPoints
+      .filter((p) => Number.isFinite(p?.x) && Number.isFinite(p?.y))
+      .map((p) => ({ x: Number(p.x), y: Number(p.y) }));
+    if (points.length < 6) return false;
 
-    const width = maxX - minX;
-    const height = maxY - minY;
-    const distStartEnd = Math.hypot(end.x - start.x, end.y - start.y);
+    const distance = (a, b) => Math.hypot(b.x - a.x, b.y - a.y);
+    const pathLength = points.slice(1).reduce((sum, p, i) => sum + distance(points[i], p), 0);
+    if (pathLength < 18) return false;
 
-    // Line
-    if (distStartEnd > Math.max(width, height) * 0.92 && points.length < 40) {
-      elementsRef.current.push({
-        id: Date.now(),
+    const xs = points.map((p) => p.x);
+    const ys = points.map((p) => p.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const boxW = maxX - minX;
+    const boxH = maxY - minY;
+    const diagonal = Math.hypot(boxW, boxH);
+    if (diagonal < 12) return false;
+
+    const first = points[0];
+    const last = points[points.length - 1];
+    const endDistance = distance(first, last);
+    const closed = endDistance <= Math.max(18, diagonal * 0.24);
+
+    const makeShape = (shapeTool, fromX, fromY, toX, toY) => {
+      const now = Date.now();
+      return {
+        id: makeElementId(`magic-${shapeTool}`),
         type: 'shape',
-        shapeTool: 'line',
-        fromX: start.x,
-        fromY: start.y,
-        toX: end.x,
-        toY: end.y,
-        color,
-        width: lineWidth,
-      });
-      redrawCanvas();
-      broadcastAllElements();
-      return true;
-    }
-
-    // Closed shapes
-    const isClosed = distStartEnd < Math.max(width, height) * 0.25;
-    if (isClosed && width > 40 && height > 40 && points.length > 25) {
-      const centerX = minX + width / 2;
-      const centerY = minY + height / 2;
-      const radius = (width + height) / 4;
-
-      let radVariance = 0;
-      points.forEach((p) => {
-        const d = Math.hypot(p.x - centerX, p.y - centerY);
-        radVariance += Math.abs(d - radius);
-      });
-      radVariance /= points.length;
-
-      // Circle
-      if (radVariance < radius * 0.16 && Math.abs(width - height) < Math.max(width, height) * 0.20) {
-        elementsRef.current.push({
-          id: Date.now(),
-          type: 'shape',
-          shapeTool: 'circle',
-          fromX: centerX,
-          fromY: centerY,
-          toX: centerX + radius,
-          toY: centerY,
-          color,
-          width: lineWidth,
-        });
-        redrawCanvas();
-        broadcastAllElements();
-        return true;
-      }
-
-      // Rectangle
-      const aspect = width / height;
-      if (radVariance > radius * 0.28 && aspect > 0.65 && aspect < 1.55 && points.length > 35) {
-        elementsRef.current.push({
-          id: Date.now(),
-          type: 'shape',
-          shapeTool: 'rectangle',
-          fromX: minX,
-          fromY: minY,
-          toX: maxX,
-          toY: maxY,
-          color,
-          width: lineWidth,
-        });
-        redrawCanvas();
-        broadcastAllElements();
-        return true;
-      }
-    }
-
-    // Handwriting detection
-    try {
-      const strokeX = points.map((p) => Math.round(p.x));
-      const strokeY = points.map((p) => Math.round(p.y));
-      const strokeT = points.map((p) => Math.round(p.t - (points[0]?.t || 0)));
-
-      const requestBody = {
-        app_version: 0.3,
-        api_level: '533.0',
-        device: window.navigator.userAgent,
-        input_type: 0,
-        options: 'enable_pre_space',
-        requests: [
-          {
-            writing_guide: { writing_area_width: CANVAS_WIDTH, writing_area_height: CANVAS_HEIGHT },
-            pre_context: '',
-            max_num_results: 3,
-            max_completions: 0,
-            language: 'en',
-            ink: [[strokeX, strokeY, strokeT]],
-          },
-        ],
+        shapeTool,
+        fromX,
+        fromY,
+        toX,
+        toY,
+        color: colorRef.current,
+        width: lineWidthRef.current,
+        createdAt: now,
+        updatedAt: now,
       };
+    };
 
-      const response = await fetch(
-        'https://inputtools.google.com/request?ime=handwriting&app=mobilesearch&cs=1&oe=UTF-8',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody),
-        }
-      );
+    const commitShape = (el) => {
+      elementsRef.current.push(el);
+      redrawCanvas();
+      broadcastElement(el);
+      return true;
+    };
 
-      const data = await response.json();
-      if (data && data[0] === 'SUCCESS' && data[1] && data[1][0] && data[1][0][1]) {
-        const recognized = data[1][0][1][0];
+    // Ramer-Douglas-Peucker simplification for corner detection.
+    const perpendicularDistance = (point, a, b) => {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      if (dx === 0 && dy === 0) return distance(point, a);
+      return Math.abs(dy * point.x - dx * point.y + b.x * a.y - b.y * a.x) / Math.hypot(dx, dy);
+    };
 
-        if (recognized && recognized.trim().length > 0) {
-          const fontSize = Math.max(Math.round(height * 1.05), 32);
-          elementsRef.current.push({
-            id: Date.now(),
-            type: 'text',
-            text: recognized,
-            x: minX,
-            y: maxY,
-            color,
-            fontSize,
-          });
-          redrawCanvas();
-          broadcastAllElements();
-          return true;
-        }
+    const simplify = (pts, epsilon) => {
+      if (pts.length < 3) return pts;
+      let maxDist = 0;
+      let index = 0;
+      for (let i = 1; i < pts.length - 1; i++) {
+        const d = perpendicularDistance(pts[i], pts[0], pts[pts.length - 1]);
+        if (d > maxDist) { maxDist = d; index = i; }
       }
-    } catch (err) {
-      console.warn('Handwriting error:', err);
+      if (maxDist > epsilon) {
+        const left = simplify(pts.slice(0, index + 1), epsilon);
+        const right = simplify(pts.slice(index), epsilon);
+        return left.slice(0, -1).concat(right);
+      }
+      return [pts[0], pts[pts.length - 1]];
+    };
+
+    // 1) Circle: closed path + near-uniform radius around its center.
+    if (closed && boxW > 20 && boxH > 20) {
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      const radii = points.map((p) => Math.hypot(p.x - centerX, p.y - centerY));
+      const avgRadius = radii.reduce((a, b) => a + b, 0) / radii.length;
+      const meanError = radii.reduce((sum, r) => sum + Math.abs(r - avgRadius), 0) / radii.length;
+      const aspect = Math.min(boxW, boxH) / Math.max(boxW, boxH);
+      if (avgRadius > 10 && aspect > 0.65 && meanError / avgRadius < 0.22) {
+        return commitShape(makeShape('circle', centerX, centerY, centerX + avgRadius, centerY));
+      }
+    }
+
+    // 2) Straight line / arrow. First simplify the path so hand jitter does
+    // not prevent recognition.
+    const simplifiedOpen = simplify(points, Math.max(3, diagonal * 0.035));
+    const direct = distance(first, last);
+    const straightness = direct / pathLength;
+
+    if (direct > 28 && straightness > 0.88) {
+      return commitShape(makeShape('line', first.x, first.y, last.x, last.y));
+    }
+
+    // Arrow: open path with a long shaft and a compact V-shaped head.
+    // Find the point farthest from the starting point; that is normally the
+    // arrow tip even when the user finishes by drawing one side of the head.
+    let tipIndex = 0;
+    let maxFromStart = 0;
+    for (let i = 1; i < points.length; i++) {
+      const d = distance(first, points[i]);
+      if (d > maxFromStart) { maxFromStart = d; tipIndex = i; }
+    }
+
+    if (!closed && maxFromStart > 30 && tipIndex > 1 && tipIndex < points.length - 2) {
+      const tip = points[tipIndex];
+      const headSpan = Math.max(10, diagonal * 0.18);
+      const beforeTip = points[Math.max(0, tipIndex - Math.floor(points.length * 0.08))];
+      const afterTip = points[Math.min(points.length - 1, tipIndex + Math.floor(points.length * 0.08))];
+      const shaftAngle = Math.atan2(tip.y - first.y, tip.x - first.x);
+      const leftAngle = Math.atan2(beforeTip.y - tip.y, beforeTip.x - tip.x);
+      const rightAngle = Math.atan2(afterTip.y - tip.y, afterTip.x - tip.x);
+      let d1 = Math.abs(leftAngle - shaftAngle);
+      let d2 = Math.abs(rightAngle - shaftAngle);
+      if (d1 > Math.PI) d1 = 2 * Math.PI - d1;
+      if (d2 > Math.PI) d2 = 2 * Math.PI - d2;
+      const hasHeadTurn = d1 > 0.45 || d2 > 0.45;
+      const compactHead = distance(beforeTip, tip) < headSpan && distance(afterTip, tip) < headSpan;
+      if (hasHeadTurn && compactHead) {
+        return commitShape(makeShape('arrow', first.x, first.y, tip.x, tip.y));
+      }
+    }
+
+    // 3) Closed polygons. Simplify aggressively enough to ignore hand shake,
+    // but not so aggressively that a triangle becomes a line.
+    if (closed && boxW > 18 && boxH > 18) {
+      const simplified = simplify(points, Math.max(4, diagonal * 0.055));
+      const corners = simplified.length - 1; // last point closes the first
+      const aspect = Math.min(boxW, boxH) / Math.max(boxW, boxH);
+
+      if (corners === 3 && aspect > 0.30) {
+        return commitShape(makeShape('triangle', minX, minY, maxX, maxY));
+      }
+      if (corners === 4 && aspect > 0.20) {
+        return commitShape(makeShape('rectangle', minX, minY, maxX, maxY));
+      }
     }
 
     return false;
   };
 
-  // Chat
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
@@ -755,7 +1254,7 @@ export default function App() {
 
     const newMsg = {
       id: Date.now(),
-      sender: `${isHost ? '👑 ' : '👤 '}${userName || (isHost ? 'Host' : 'Guest')}`,
+      sender: `${isHost || isCoHost ? '👑 ' : '👤 '}${userName || (isHost ? 'Host' : 'Guest')}`,
       text: chatInput.trim(),
       time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     };
@@ -769,7 +1268,6 @@ export default function App() {
     setChatInput('');
   };
 
-  // Slide Snaps
   const captureBoardSnapshot = () => {
     const bgCanvas = bgCanvasRef.current;
     const drawCanvas = drawCanvasRef.current;
@@ -780,28 +1278,8 @@ export default function App() {
     merged.height = window.innerHeight;
     const mCtx = merged.getContext('2d');
 
-    mCtx.drawImage(
-      bgCanvas,
-      -panOffset.x / zoomScale,
-      -panOffset.y / zoomScale,
-      window.innerWidth / zoomScale,
-      window.innerHeight / zoomScale,
-      0,
-      0,
-      window.innerWidth,
-      window.innerHeight
-    );
-    mCtx.drawImage(
-      drawCanvas,
-      -panOffset.x / zoomScale,
-      -panOffset.y / zoomScale,
-      window.innerWidth / zoomScale,
-      window.innerHeight / zoomScale,
-      0,
-      0,
-      window.innerWidth,
-      window.innerHeight
-    );
+    mCtx.drawImage(bgCanvas, -panOffset.x / zoomScale, -panOffset.y / zoomScale, window.innerWidth / zoomScale, window.innerHeight / zoomScale, 0, 0, window.innerWidth, window.innerHeight);
+    mCtx.drawImage(drawCanvas, -panOffset.x / zoomScale, -panOffset.y / zoomScale, window.innerWidth / zoomScale, window.innerHeight / zoomScale, 0, 0, window.innerWidth, window.innerHeight);
 
     const dataUrl = merged.toDataURL('image/png');
     const newSlide = {
@@ -818,21 +1296,16 @@ export default function App() {
 
   const exportSlidesToPdf = () => {
     if (savedSlides.length === 0) {
-      alert('No slides captured! Click "📸 Snap" to capture slides first.');
+      alert('No slides captured!');
       return;
     }
-
     if (!window.jspdf || !window.jspdf.jsPDF) {
-      alert('PDF generation engine loading, please try again.');
+      alert('PDF generation engine loading...');
       return;
     }
 
     const { jsPDF } = window.jspdf;
-    const doc = new jsPDF({
-      orientation: 'landscape',
-      unit: 'px',
-      format: [window.innerWidth, window.innerHeight],
-    });
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'px', format: [window.innerWidth, window.innerHeight] });
 
     savedSlides.forEach((slide, index) => {
       if (index > 0) doc.addPage([window.innerWidth, window.innerHeight], 'landscape');
@@ -843,6 +1316,7 @@ export default function App() {
   };
 
   const updateHostPermission = (key, value) => {
+    if (!isHost) return;
     const updated = { ...permissions, [key]: value };
     setPermissions(updated);
     channelRef.current?.send({
@@ -852,15 +1326,86 @@ export default function App() {
     });
   };
 
-  const handleZoom = (delta) => {
-    const newScale = Math.min(Math.max(Number((zoomScale + delta).toFixed(1)), 0.4), 3.0);
-    setZoomScale(newScale);
+  const toggleCoHostStatus = (targetClientId) => {
+    if (!isHost || targetClientId === myClientId) return;
+    let updatedCoHosts = [...coHostIds];
+    if (updatedCoHosts.includes(targetClientId)) {
+      updatedCoHosts = updatedCoHosts.filter((id) => id !== targetClientId);
+    } else {
+      updatedCoHosts.push(targetClientId);
+    }
+    setCoHostIds(updatedCoHosts);
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'cohost-update',
+      payload: { coHostIds: updatedCoHosts },
+    });
+  };
 
+  const updateParticipantOverride = (targetClientId, permKey, value) => {
+    if (!isHost || targetClientId === myClientId) return;
+    const current = participantOverrides[targetClientId] || {
+      canDraw: null,
+      canText: null,
+      canUpload: null,
+      canVoice: null,
+      canSharePointer: null,
+    };
+    const updatedForPeer = { ...current, [permKey]: value };
+    setParticipantOverrides((prev) => ({ ...prev, [targetClientId]: updatedForPeer }));
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'individual-permission-update',
+      payload: { targetClientId, permissions: updatedForPeer },
+    });
+  };
+
+  const kickParticipant = (targetClientId) => {
+    if (!isHost || targetClientId === myClientId) return;
+    const target = participants.find((p) => p.clientId === targetClientId);
+    if (!target) return;
+    if (!window.confirm(`Remove ${target.userName || 'this participant'} from the room?`)) return;
+
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'kick-participant',
+      payload: { targetClientId },
+    });
+  };
+
+  const transferHost = (targetClientId) => {
+    if (!isHost || targetClientId === myClientId) return;
+    const target = participants.find((p) => p.clientId === targetClientId);
+    if (!target) return;
+    if (!window.confirm(`Make ${target.userName || 'this participant'} the new host?`)) return;
+
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'host-transfer',
+      payload: { newHostId: targetClientId },
+    });
+
+    setIsHost(false);
+    setIsCoHost(false);
+    setCoHostIds([]);
+    channelRef.current?.track({
+      clientId: myClientId,
+      userName,
+      isHost: false,
+      isCoHost: false,
+      isMicOn,
+      permissions: userPermissions,
+    });
+  };
+
+  const handleZoom = (delta) => {
+    const newScale = Math.min(Math.max(Number((zoomScaleRef.current + delta).toFixed(2)), 0.3), 3.0);
+    setZoomScale(newScale);
     if (isHost && permissions.syncZoomGlobally) {
       channelRef.current?.send({
         type: 'broadcast',
         event: 'sync-view',
-        payload: { scale: newScale, pan: panOffset },
+        payload: { scale: newScale, pan: panOffsetRef.current },
       });
     }
   };
@@ -868,6 +1413,8 @@ export default function App() {
   const handleResetZoom = () => {
     setZoomScale(1);
     setPanOffset({ x: 0, y: 0 });
+    panOffsetRef.current = { x: 0, y: 0 };
+    zoomScaleRef.current = 1;
     if (isHost && permissions.syncZoomGlobally) {
       channelRef.current?.send({
         type: 'broadcast',
@@ -877,83 +1424,260 @@ export default function App() {
     }
   };
 
-  // WebRTC
-  const createPeerConnection = () => {
+  const ensureRemoteAudio = (peerId, stream) => {
+    let audioEl = remoteAudiosRef.current[peerId];
+
+    if (!audioEl) {
+      audioEl = document.createElement('audio');
+      audioEl.autoplay = true;
+      audioEl.playsInline = true;
+      audioEl.controls = false;
+      audioEl.muted = false;
+      audioEl.volume = 1;
+      audioEl.setAttribute('aria-hidden', 'true');
+      audioEl.style.position = 'fixed';
+      audioEl.style.width = '1px';
+      audioEl.style.height = '1px';
+      audioEl.style.opacity = '0';
+      audioEl.style.pointerEvents = 'none';
+      document.body.appendChild(audioEl);
+      remoteAudiosRef.current[peerId] = audioEl;
+    }
+
+    audioEl.srcObject = stream;
+    const playPromise = audioEl.play();
+    if (playPromise?.catch) {
+      playPromise.catch(() => {
+        // Browser autoplay may require one user gesture. The Voice button
+        // provides that gesture; retry on the next interaction if necessary.
+      });
+    }
+  };
+
+  const flushPendingCandidates = async (peerId, pc) => {
+    const pending = pendingCandidatesRef.current[peerId] || [];
+    if (!pc.remoteDescription) return;
+
+    for (const candidate of pending) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.warn('ICE candidate error:', err);
+      }
+    }
+    delete pendingCandidatesRef.current[peerId];
+  };
+
+  const createPeerConnection = (targetPeerId) => {
+    if (peerConnectionsRef.current[targetPeerId]) {
+      return peerConnectionsRef.current[targetPeerId];
+    }
+
     const pc = new RTCPeerConnection(rtcConfig);
+    pendingCandidatesRef.current[targetPeerId] = pendingCandidatesRef.current[targetPeerId] || [];
+
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         channelRef.current?.send({
           type: 'broadcast',
           event: 'webrtc-candidate',
-          payload: { candidate: event.candidate },
+          payload: {
+            from: myClientId,
+            to: targetPeerId,
+            candidate: event.candidate,
+          },
         });
       }
     };
+
     pc.ontrack = (event) => {
-      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = event.streams[0];
+      const stream = event.streams?.[0] || new MediaStream([event.track]);
+      ensureRemoteAudio(targetPeerId, stream);
     };
+
+    pc.onconnectionstatechange = () => {
+      if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) {
+        if (pc.connectionState !== 'disconnected') {
+          delete peerConnectionsRef.current[targetPeerId];
+        }
+      }
+    };
+
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current));
+      localStreamRef.current.getTracks().forEach((track) => {
+        const alreadyAdded = pc.getSenders().some((sender) => sender.track?.kind === track.kind);
+        if (!alreadyAdded) pc.addTrack(track, localStreamRef.current);
+      });
+    } else {
+      // Keep an audio receiving path ready even before this user turns on mic.
+      try {
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+      } catch (err) {}
     }
-    peerConnectionRef.current = pc;
+
+    peerConnectionsRef.current[targetPeerId] = pc;
     return pc;
   };
 
-  const startVoiceChat = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      localStreamRef.current = stream;
-      setIsMicOn(true);
-      setIsVoiceConnected(true);
+  const negotiateWithPeer = async (targetPeerId) => {
+    const pc = createPeerConnection(targetPeerId);
+    if (makingOfferRef.current[targetPeerId]) return;
+    if (pc.signalingState !== 'stable') return;
 
-      const pc = createPeerConnection();
+    makingOfferRef.current[targetPeerId] = true;
+    try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
       channelRef.current?.send({
         type: 'broadcast',
         event: 'webrtc-offer',
-        payload: { offer },
+        payload: {
+          from: myClientId,
+          to: targetPeerId,
+          offer: pc.localDescription,
+        },
       });
     } catch (err) {
-      alert('Microphone access denied or unavailable.');
+      console.warn('WebRTC offer error:', err);
+    } finally {
+      makingOfferRef.current[targetPeerId] = false;
     }
   };
 
-  const handleReceiveOffer = async (offer) => {
-    let stream = localStreamRef.current;
-    if (!stream) {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        localStreamRef.current = stream;
-        setIsMicOn(true);
-        setIsVoiceConnected(true);
-      } catch (err) {
-        return;
-      }
-    }
-    const pc = createPeerConnection();
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+  const handleReceiveOffer = async (fromPeerId, offer) => {
+    try {
+      const pc = createPeerConnection(fromPeerId);
 
+      // Deterministic negotiation: only the lexicographically smaller client
+      // is allowed to initiate. If the larger client sends an offer anyway,
+      // ignore it instead of creating an offer collision.
+      if (myClientId < fromPeerId) return;
+
+      if (pc.signalingState !== 'stable') return;
+
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      await flushPendingCandidates(fromPeerId, pc);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      channelRef.current?.send({
+        type: 'broadcast',
+        event: 'webrtc-answer',
+        payload: {
+          from: myClientId,
+          to: fromPeerId,
+          answer: pc.localDescription,
+        },
+      });
+    } catch (err) {
+      console.warn('WebRTC offer handling error:', err);
+    }
+  };
+
+  const requestVoiceNegotiation = () => {
     channelRef.current?.send({
       type: 'broadcast',
-      event: 'webrtc-answer',
-      payload: { answer },
+      event: 'webrtc-renegotiate-request',
+      payload: { from: myClientId },
+    });
+
+    Object.keys(peerConnectionsRef.current).forEach((peerId) => {
+      if (myClientId < peerId) negotiateWithPeer(peerId);
     });
   };
 
-  const toggleMic = () => {
-    if (!localStreamRef.current) {
-      startVoiceChat();
+  const startVoiceChat = async () => {
+    if (!canUserVoice) {
+      alert('Microphone permissions disabled.');
       return;
     }
-    const audioTrack = localStreamRef.current.getAudioTracks()[0];
-    if (audioTrack) {
-      audioTrack.enabled = !audioTrack.enabled;
-      setIsMicOn(audioTrack.enabled);
+
+    try {
+      // Reuse an existing stream instead of opening a second microphone.
+      if (!localStreamRef.current) {
+        localStreamRef.current = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        });
+      }
+
+      const stream = localStreamRef.current;
+
+      stream.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+        Object.entries(peerConnectionsRef.current).forEach(([peerId, pc]) => {
+          const audioSender = pc.getSenders().find((sender) => sender.track?.kind === 'audio');
+          if (audioSender) {
+            audioSender.replaceTrack(track);
+          } else {
+            pc.addTrack(track, stream);
+          }
+        });
+      });
+
+      setIsMicOn(true);
+      setIsVoiceConnected(true);
+
+      channelRef.current?.track({
+        clientId: myClientId,
+        userName: userName || (isHost ? 'Host' : 'Guest'),
+        isHost,
+        isCoHost,
+        isMicOn: true,
+        permissions: userPermissions,
+      });
+
+      // Build one connection per other participant and negotiate from the
+      // deterministic initiator side. Also ask the smaller-ID peer to
+      // renegotiate if the larger-ID peer just enabled its microphone.
+      participants.forEach((peer) => {
+        if (!peer.clientId || peer.clientId === myClientId) return;
+        createPeerConnection(peer.clientId);
+      });
+      requestVoiceNegotiation();
+    } catch (err) {
+      console.error('Microphone access error:', err);
+      alert('Microphone access denied or unavailable. Check browser microphone permission.');
     }
+  };
+
+  const toggleMic = async () => {
+    if (!canUserVoice) {
+      alert('Microphone permission disabled.');
+      return;
+    }
+
+    if (!localStreamRef.current) {
+      await startVoiceChat();
+      return;
+    }
+
+    const audioTrack = localStreamRef.current.getAudioTracks()[0];
+    if (!audioTrack) {
+      await startVoiceChat();
+      return;
+    }
+
+    const newEnabled = !audioTrack.enabled;
+    audioTrack.enabled = newEnabled;
+    setIsMicOn(newEnabled);
+
+    channelRef.current?.track({
+      clientId: myClientId,
+      userName: userName || (isHost ? 'Host' : 'Guest'),
+      isHost,
+      isCoHost,
+      isMicOn: newEnabled,
+      permissions: userPermissions,
+    });
+
+    if (newEnabled) requestVoiceNegotiation();
   };
 
   useEffect(() => {
@@ -962,16 +1686,13 @@ export default function App() {
     }
   }, [textInput.visible]);
 
-  // Robust Single Page Document Rendering
   const renderImageOnCanvas = (dataUrl) => {
     const img = new Image();
     img.onload = () => {
       const bgCanvas = bgCanvasRef.current;
       const bgCtx = bgCanvas.getContext('2d');
-
       bgCtx.fillStyle = '#ffffff';
       bgCtx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-
       const x = Math.max(60, (window.innerWidth - img.width) / 2);
       bgCtx.drawImage(img, x, 40);
       setHasDocument(true);
@@ -1000,22 +1721,24 @@ export default function App() {
           payload: { dataUrl, page: targetPage, total: pdf.numPages },
         });
       }
-    } catch (err) {
-      console.error('PDF Page Render Error:', err);
-    }
+    } catch (err) {}
   };
 
   const handleFileUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    if (!canUserUpload) {
+      alert('File/PDF upload permission is disabled. Ask the host to allow Upload.');
+      e.target.value = '';
+      return;
+    }
 
     if (file.type === 'application/pdf') {
       const fileReader = new FileReader();
       fileReader.onload = async function () {
         const typedarray = new Uint8Array(this.result);
         if (window.pdfjsLib) {
-          window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
           const pdf = await window.pdfjsLib.getDocument(typedarray).promise;
           pdfDocRef.current = pdf;
           setNumPages(pdf.numPages);
@@ -1064,14 +1787,52 @@ export default function App() {
     if (fileInputRef.current) fileInputRef.current.value = '';
 
     if (broadcast) {
-      channelRef.current?.send({
-        type: 'broadcast',
-        event: 'delete-doc',
-      });
+      channelRef.current?.send({ type: 'broadcast', event: 'delete-doc' });
     }
   };
 
-  // OCR Extraction
+  useEffect(() => {
+    if (!isSessionActive || !roomId) return;
+    const loadPrivateNotes = async () => {
+      const storageKey = `studysync_notes_${roomId}_${userName || 'user'}`;
+      const cached = localStorage.getItem(storageKey);
+      if (cached) setPrivateNotes(cached);
+
+      try {
+        const { data } = await supabase
+          .from('private_notes')
+          .select('content')
+          .eq('room_id', roomId)
+          .eq('user_id', userName || myClientId)
+          .maybeSingle();
+
+        if (data && data.content) {
+          setPrivateNotes(data.content);
+          localStorage.setItem(storageKey, data.content);
+        }
+      } catch (err) {}
+    };
+    loadPrivateNotes();
+  }, [isSessionActive, roomId, userName]);
+
+  const savePrivateNotes = async (text) => {
+    setPrivateNotes(text);
+    setNotesSaveStatus('Saving...');
+    const storageKey = `studysync_notes_${roomId}_${userName || 'user'}`;
+    localStorage.setItem(storageKey, text);
+
+    try {
+      await supabase.from('private_notes').upsert(
+        { room_id: roomId, user_id: userName || myClientId, content: text, updated_at: new Date().toISOString() },
+        { onConflict: 'room_id,user_id' }
+      );
+      setNotesSaveStatus('Saved to Cloud');
+    } catch (e) {
+      setNotesSaveStatus('Saved Locally');
+    }
+    setTimeout(() => setNotesSaveStatus('Saved'), 2000);
+  };
+
   const extractTextFromRegion = async (x1, y1, x2, y2) => {
     const minX = Math.min(x1, x2);
     const minY = Math.min(y1, y2);
@@ -1080,75 +1841,38 @@ export default function App() {
 
     if (width < 10 || height < 10) return;
     if (!window.Tesseract) {
-      alert('OCR Engine loading, please wait 2 seconds.');
+      alert('OCR Engine loading...');
       return;
     }
 
     setIsExtracting(true);
-
     try {
       const bgCanvas = bgCanvasRef.current;
       const cropCanvas = document.createElement('canvas');
       cropCanvas.width = width;
       cropCanvas.height = height;
       const cropCtx = cropCanvas.getContext('2d');
-
       cropCtx.drawImage(bgCanvas, minX, minY, width, height, 0, 0, width, height);
 
       const result = await window.Tesseract.recognize(cropCanvas, 'eng');
       const extractedText = result.data.text.trim();
 
       if (extractedText) {
-        setSharedNotes((prev) => {
-          const updated = prev ? `${prev}\n\n• ${extractedText}` : `• ${extractedText}`;
-          channelRef.current?.send({
-            type: 'broadcast',
-            event: 'sync-notes',
-            payload: { text: updated },
-          });
-          return updated;
-        });
-
+        const updated = privateNotes ? `${privateNotes}\n\n• ${extractedText}` : `• ${extractedText}`;
+        savePrivateNotes(updated);
         setShowNotesPad(true);
-        navigator.clipboard.writeText(extractedText);
-        setCopySuccess(true);
-        setTimeout(() => setCopySuccess(false), 2000);
       }
     } catch (err) {
-      console.error(err);
     } finally {
       setIsExtracting(false);
     }
   };
 
-  // Notes Pad Handlers
-  const handleNotesChange = (e) => {
-    const text = e.target.value;
-    setSharedNotes(text);
-    channelRef.current?.send({
-      type: 'broadcast',
-      event: 'sync-notes',
-      payload: { text },
-    });
-  };
-
-  const copyNotesToClipboard = () => {
-    navigator.clipboard.writeText(sharedNotes);
-    setCopySuccess(true);
-    setTimeout(() => setCopySuccess(false), 2000);
-  };
-
-  const downloadNotesFile = () => {
-    const element = document.createElement('a');
-    const file = new Blob([sharedNotes || 'No notes taken during this session.'], { type: 'text/plain;charset=utf-8' });
-    element.href = URL.createObjectURL(file);
-    element.download = `${roomId}-study-notes.txt`;
-    document.body.appendChild(element);
-    element.click();
-    document.body.removeChild(element);
-  };
-
   const commitText = () => {
+    if (!canUserText) {
+      setTextInput({ visible: false, x: 0, y: 0, text: '' });
+      return;
+    }
     if (!textInput.text.trim()) {
       setTextInput({ visible: false, x: 0, y: 0, text: '' });
       return;
@@ -1157,13 +1881,15 @@ export default function App() {
     const targetY = textInput.y + fontSize * 0.8;
 
     elementsRef.current.push({
-      id: Date.now(),
+      id: makeElementId('text'),
       type: 'text',
       text: textInput.text,
       x: textInput.x,
       y: targetY,
       color,
       fontSize,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
     });
 
     redrawCanvas();
@@ -1179,11 +1905,11 @@ export default function App() {
     };
   };
 
-  const canUserDraw = isHost || permissions.canDraw;
+  const canUserDraw = isHost || isCoHost || (userPermissions.canDraw ?? permissions.canDraw);
+  const canUserText = isHost || isCoHost || (userPermissions.canText ?? permissions.canText);
+  const canUserUpload = isHost || isCoHost || (userPermissions.canUpload ?? permissions.canUpload);
+  const canUserVoice = isHost || isCoHost || (userPermissions.canVoice ?? permissions.canVoiceChat);
 
-  // =========================================================================
-  // MOUSE & TOUCH HANDLERS (Drawing + Move Tool + Magic Pen 1.5s)
-  // =========================================================================
   const handleMouseDown = (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'TEXTAREA') return;
 
@@ -1191,18 +1917,17 @@ export default function App() {
     setShowShapesMenu(false);
     setShowColorPalette(false);
 
-    // 1. SELECT & MOVE TOOL (Pakkaki drag cheyatam)
     if (tool === 'select') {
-      let foundIndex = null;
+      let foundEl = null;
       for (let i = elementsRef.current.length - 1; i >= 0; i--) {
         if (isPointInsideElement(x, y, elementsRef.current[i])) {
-          foundIndex = i;
+          foundEl = elementsRef.current[i];
           break;
         }
       }
 
-      setSelectedElementIndex(foundIndex);
-      if (foundIndex !== null) {
+      setSelectedElementId(foundEl ? foundEl.id : null);
+      if (foundEl) {
         isDraggingElementRef.current = true;
         dragStartPosRef.current = { x, y };
       }
@@ -1210,8 +1935,9 @@ export default function App() {
       return;
     }
 
-    // 2. MAGIC / LASER PEN (1.5 seconds fade out)
     if (tool === 'laser') {
+      const canLaser = isHost || isCoHost || (userPermissions.canSharePointer ?? permissions.canSharePointer);
+      if (!canLaser) return;
       setIsDrawing(true);
       addLaserPoint(x, y, true);
       channelRef.current?.send({
@@ -1223,21 +1949,43 @@ export default function App() {
     }
 
     if (tool === 'sticky') {
+      if (!canUserDraw) return;
       addStickyNote(x, y);
       return;
     }
 
-    if (!canUserDraw && tool !== 'extract') return;
-
     if (tool === 'text') {
+      if (!canUserText) {
+        alert('Text permission is disabled. Ask the host to allow Text.');
+        return;
+      }
       if (textInput.visible) commitText();
       setTextInput({ visible: true, x, y, text: '' });
+      return;
+    }
+
+    // Guests who are not granted Draw permission may doodle locally,
+    // but their stroke is never added to shared elements or broadcast.
+    // Hosts/co-hosts and permitted guests are shared normally.
+    if (!canUserDraw && tool !== 'extract') {
+      if (['pencil', 'eraser', 'highlighter', 'smart'].includes(tool)) {
+        setIsDrawing(true);
+        isDrawingRef.current = true;
+        setStartPos({ x, y });
+        const drawCanvas = drawCanvasRef.current;
+        setSnapshot(drawCtxRef.current.getImageData(0, 0, drawCanvas.width, drawCanvas.height));
+        strokeStartTimeRef.current = Date.now();
+        currentStrokeRef.current = [{ x, y, t: 0 }];
+        drawCtxRef.current.beginPath();
+        drawCtxRef.current.moveTo(x, y);
+      }
       return;
     }
 
     if (textInput.visible) commitText();
 
     setIsDrawing(true);
+    isDrawingRef.current = true;
     setStartPos({ x, y });
 
     const drawCanvas = drawCanvasRef.current;
@@ -1288,22 +2036,20 @@ export default function App() {
       const outerRadius = Math.hypot(toX - fromX, toY - fromY);
       const innerRadius = outerRadius / 2;
       let rot = (Math.PI / 2) * 3;
-      let cx = fromX;
-      let cy = fromY;
       const step = Math.PI / spikes;
 
-      ctx.moveTo(cx, cy - outerRadius);
+      ctx.moveTo(fromX, fromY - outerRadius);
       for (let i = 0; i < spikes; i++) {
-        let sx = cx + Math.cos(rot) * outerRadius;
-        let sy = cy + Math.sin(rot) * outerRadius;
+        let sx = fromX + Math.cos(rot) * outerRadius;
+        let sy = fromY + Math.sin(rot) * outerRadius;
         ctx.lineTo(sx, sy);
         rot += step;
-        sx = cx + Math.cos(rot) * innerRadius;
-        sy = cy + Math.sin(rot) * innerRadius;
+        sx = fromX + Math.cos(rot) * innerRadius;
+        sy = fromY + Math.sin(rot) * innerRadius;
         ctx.lineTo(sx, sy);
         rot += step;
       }
-      ctx.lineTo(cx, cy - outerRadius);
+      ctx.lineTo(fromX, fromY - outerRadius);
       ctx.closePath();
       ctx.stroke();
     }
@@ -1312,23 +2058,22 @@ export default function App() {
   const handleMouseMove = (e) => {
     const { x, y } = getCanvasCoords(e);
 
-    // 1. Drag & Move Selected Element
     if (tool === 'select') {
-      if (isDraggingElementRef.current && selectedElementIndex !== null) {
+      if (isDraggingElementRef.current && selectedElementId !== null) {
         const dx = x - dragStartPosRef.current.x;
         const dy = y - dragStartPosRef.current.y;
         dragStartPosRef.current = { x, y };
 
-        const targetEl = elementsRef.current[selectedElementIndex];
+        const targetEl = elementsRef.current.find((el) => el.id === selectedElementId);
         if (targetEl) {
           moveElementByDelta(targetEl, dx, dy);
+          targetEl.updatedAt = Date.now();
           redrawCanvas();
         }
       }
       return;
     }
 
-    // 2. Laser Points Trail
     if (tool === 'laser' && isDrawing) {
       addLaserPoint(x, y);
       channelRef.current?.send({
@@ -1339,21 +2084,21 @@ export default function App() {
       return;
     }
 
-    const canSendPointer = isHost || permissions.canSharePointer;
-    if (shareMyPointer && canSendPointer) {
+    const canSendPointer = isHost || isCoHost || (userPermissions.canSharePointer ?? permissions.canSharePointer);
+    if (canSendPointer && (isHost || isCoHost || shareMyPointer)) {
       channelRef.current?.send({
         type: 'broadcast',
         event: 'cursor-move',
-        payload: { x, y, visible: true, name: userName || (isHost ? 'Host' : 'Guest') },
+        payload: { clientId: myClientId, x, y, visible: true, name: userName || (isHost ? 'Host' : 'Guest'), isHost: isHost || isCoHost },
       });
     }
 
     if (!isDrawing) return;
-    if (!canUserDraw && tool !== 'extract') return;
 
     const ctx = drawCtxRef.current;
+    const isLocalOnlyStroke = !canUserDraw && ['pencil', 'eraser', 'highlighter', 'smart'].includes(tool);
 
-    if (tool === 'pencil' || tool === 'eraser' || tool === 'highlighter') {
+    if (['pencil', 'eraser', 'highlighter'].includes(tool)) {
       ctx.lineTo(x, y);
       ctx.stroke();
       currentStrokeRef.current.push({ x, y });
@@ -1376,36 +2121,50 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (!isSessionActive) return;
+
+    const releasePointer = (event) => {
+      if (isDrawing) handleMouseUp(event);
+    };
+
+    window.addEventListener('mouseup', releasePointer);
+    return () => window.removeEventListener('mouseup', releasePointer);
+  }, [isSessionActive, isDrawing, tool]);
+
   const handleMouseLeave = () => {
-    if (shareMyPointer && (isHost || permissions.canSharePointer)) {
+    const canSendPointer = isHost || isCoHost || (userPermissions.canSharePointer ?? permissions.canSharePointer);
+    if (canSendPointer && (isHost || isCoHost || shareMyPointer)) {
       channelRef.current?.send({
         type: 'broadcast',
         event: 'cursor-move',
-        payload: { x: -100, y: -100, visible: false, name: '' },
+        payload: { clientId: myClientId, x: -100, y: -100, visible: false, name: '' },
       });
     }
     handleMouseUp();
   };
 
   const handleMouseUp = (e) => {
-    // 1. Release Move Drag
     if (tool === 'select') {
       if (isDraggingElementRef.current) {
         isDraggingElementRef.current = false;
-        broadcastAllElements();
+        const moved = elementsRef.current.find((el) => el.id === selectedElementId);
+        if (moved) broadcastUpdatedElement(moved);
       }
       return;
     }
 
-    // 2. Release Laser
     if (tool === 'laser') {
       setIsDrawing(false);
+      isDrawingRef.current = false;
       return;
     }
 
     if (!isDrawing) return;
     setIsDrawing(false);
+    isDrawingRef.current = false;
 
+    const isLocalOnlyStroke = !canUserDraw && ['pencil', 'eraser', 'highlighter', 'smart'].includes(tool);
     const { x, y } = e ? getCanvasCoords(e) : startPos;
 
     if (tool === 'extract') {
@@ -1419,40 +2178,63 @@ export default function App() {
       const strokePoints = [...currentStrokeRef.current];
       currentStrokeRef.current = [];
 
+      // Unpermitted guest strokes are local-only and disappear on release.
+      if (isLocalOnlyStroke) {
+        if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
+        return;
+      }
+
       if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
-      recognizeAndDrawSmartShape(strokePoints, drawCtxRef.current).then((converted) => {
-        if (!converted) {
-          elementsRef.current.push({
-            id: Date.now(),
-            type: 'stroke',
-            points: strokePoints,
-            color,
-            width: lineWidth,
-          });
-          redrawCanvas();
-          broadcastAllElements();
-        }
-      });
+      const corrected = recognizeAndDrawSmartShape(strokePoints);
+
+      // If the stroke is not confidently recognizable as a shape, Smart Pen
+      // must behave like a normal pen instead of silently deleting the stroke.
+      if (!corrected && strokePoints.length > 1) {
+        const now = Date.now();
+        const fallback = {
+          id: makeElementId('smart-stroke'),
+          type: 'stroke',
+          points: strokePoints,
+          color: colorRef.current,
+          width: lineWidthRef.current,
+          createdAt: now,
+          updatedAt: now,
+        };
+        elementsRef.current.push(fallback);
+        redrawCanvas();
+        broadcastElement(fallback);
+      }
       return;
     }
 
     if (['pencil', 'eraser', 'highlighter'].includes(tool)) {
       drawCtxRef.current.closePath();
-      elementsRef.current.push({
-        id: Date.now(),
+
+      if (isLocalOnlyStroke) {
+        if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
+        currentStrokeRef.current = [];
+        return;
+      }
+
+      const newElement = {
+        id: makeElementId('stroke'),
         type: 'stroke',
         points: [...currentStrokeRef.current],
         color,
         width: lineWidth,
         isHighlighter: tool === 'highlighter',
         isEraser: tool === 'eraser',
-      });
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      elementsRef.current.push(newElement);
       currentStrokeRef.current = [];
-      broadcastAllElements();
+      redrawCanvas();
+      broadcastElement(newElement);
     } else {
       if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
-      elementsRef.current.push({
-        id: Date.now(),
+      const newElement = {
+        id: makeElementId('shape'),
         type: 'shape',
         shapeTool: tool,
         fromX: startPos.x,
@@ -1461,9 +2243,12 @@ export default function App() {
         toY: y,
         color,
         width: lineWidth,
-      });
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      elementsRef.current.push(newElement);
       redrawCanvas();
-      broadcastAllElements();
+      broadcastElement(newElement);
     }
   };
 
@@ -1473,10 +2258,8 @@ export default function App() {
     redrawCanvas();
     setTextInput({ visible: false, x: 0, y: 0, text: '' });
 
-    channelRef.current?.send({
-      type: 'broadcast',
-      event: 'clear-board',
-    });
+    safeBroadcast('board-clear', { clearedAt: Date.now() });
+    safeBroadcast('clear-board', { clearedAt: Date.now() });
   };
 
   const copyInviteLink = () => {
@@ -1486,23 +2269,31 @@ export default function App() {
     setTimeout(() => setCopiedLink(false), 2200);
   };
 
+  const changeTool = (nextTool) => {
+    if (isDrawingRef.current) {
+      // Cancel only the transient preview. The canonical element list is never
+      // touched, so changing Pencil -> Highlighter can never erase old work.
+      currentStrokeRef.current = [];
+      isDrawingRef.current = false;
+      setIsDrawing(false);
+    }
+    toolRef.current = nextTool;
+    setTool(nextTool);
+    setSelectedElementId(null);
+    requestAnimationFrame(() => redrawCanvas());
+    setShowShapesMenu(false);
+  };
+
   const isShapeActive = ['rectangle', 'circle', 'line', 'arrow', 'triangle', 'star'].includes(tool);
 
-  // 1. Show Clean Lavender & Warm Cream Split Login Modal
   if (!isSessionActive) {
-    return (
-      <AuthRoomModal
-        onLaunchSession={handleLaunchSession}
-        initialRoom={initialUrlRoom}
-      />
-    );
+    return <AuthRoomModal onLaunchSession={handleLaunchSession} initialRoom={initialUrlRoom} />;
   }
 
-  // 2. Main Whiteboard Workspace
+  const isOnlyOneInRoom = participants.length <= 1;
+
   return (
     <div className="relative w-screen h-screen overflow-hidden select-none font-['Inter',sans-serif] bg-slate-100 text-slate-800">
-      <audio ref={remoteAudioRef} autoPlay playsInline />
-
       {/* FIXED TOP HEADER */}
       <header className="fixed top-0 left-0 right-0 h-14 bg-white/95 backdrop-blur-md border-b border-slate-200 px-5 flex items-center justify-between z-40 shadow-sm">
         <div className="flex items-center gap-3">
@@ -1510,69 +2301,46 @@ export default function App() {
             S
           </div>
           <span className="font-bold text-sm tracking-tight text-slate-900">StudySync</span>
-          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isHost ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-600'}`}>
-            {isHost ? 'Host' : 'Guest'}
+          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isHost ? 'bg-blue-100 text-blue-700' : isCoHost ? 'bg-purple-100 text-purple-700' : 'bg-slate-100 text-slate-600'}`}>
+            {isHost ? 'Host' : isCoHost ? 'Co-Host' : 'Guest'}
           </span>
           <span className="text-xs font-mono font-semibold px-2.5 py-1 rounded-lg bg-slate-100 border border-slate-200 text-slate-600">
             #{roomId}
           </span>
         </div>
 
-        {/* Center: Rec, Snap, Page Navigation */}
+        {/* Center Controls */}
         <div className="flex items-center gap-2">
           {!isRecording ? (
-            <button
-              onClick={startRecording}
-              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 transition flex items-center gap-1.5">
+            <button onClick={startRecording} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 transition flex items-center gap-1.5">
               <span className="w-2 h-2 rounded-full bg-rose-600" />
               <span>Record</span>
             </button>
           ) : (
-            <button
-              onClick={stopRecording}
-              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white shadow-sm transition flex items-center gap-2 animate-pulse">
+            <button onClick={stopRecording} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white shadow-sm transition flex items-center gap-2 animate-pulse">
               <span className="w-2 h-2 rounded-full bg-white" />
               <span>REC {formatRecordingTime(recordingSeconds)}</span>
             </button>
           )}
 
-          <button
-            onClick={captureBoardSnapshot}
-            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition flex items-center gap-1">
+          <button onClick={captureBoardSnapshot} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition flex items-center gap-1">
             <span>📸 Snap</span>
           </button>
 
-          <button
-            onClick={() => setShowSlidesDrawer(!showSlidesDrawer)}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition flex items-center gap-1 ${
-              savedSlides.length > 0 ? 'bg-indigo-50 text-indigo-700 border-indigo-200' : 'bg-slate-50 text-slate-400 border-slate-200'
-            }`}>
+          <button onClick={() => setShowSlidesDrawer(!showSlidesDrawer)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition flex items-center gap-1 ${savedSlides.length > 0 ? 'bg-indigo-50 text-indigo-700 border-indigo-200' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>
             <span>📑 Slides ({savedSlides.length})</span>
           </button>
 
-          {/* Clean 1-Page PDF Navigation */}
           {numPages > 1 && (
             <div className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 ml-1">
-              <button
-                onClick={() => changePdfPage(-1)}
-                disabled={pageNum <= 1}
-                className="hover:text-blue-600 font-bold disabled:opacity-30">
-                ◀
-              </button>
+              <button onClick={() => changePdfPage(-1)} disabled={pageNum <= 1} className="hover:text-blue-600 font-bold disabled:opacity-30">◀</button>
               <span className="font-mono">{pageNum} / {numPages}</span>
-              <button
-                onClick={() => changePdfPage(1)}
-                disabled={pageNum >= numPages}
-                className="hover:text-blue-600 font-bold disabled:opacity-30">
-                ▶
-              </button>
+              <button onClick={() => changePdfPage(1)} disabled={pageNum >= numPages} className="hover:text-blue-600 font-bold disabled:opacity-30">▶</button>
             </div>
           )}
 
           {hasDocument && (
-            <button
-              onClick={() => resetBackgroundCanvas(true)}
-              className="text-[11px] font-semibold text-rose-600 hover:bg-rose-50 px-2.5 py-1 rounded-lg border border-rose-200 transition">
+            <button onClick={() => resetBackgroundCanvas(true)} className="text-[11px] font-semibold text-rose-600 hover:bg-rose-50 px-2.5 py-1 rounded-lg border border-rose-200 transition">
               Remove Doc
             </button>
           )}
@@ -1580,139 +2348,81 @@ export default function App() {
 
         {/* Right Actions */}
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setShowChatPad(!showChatPad)}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition ${
-              showChatPad ? 'bg-blue-600 text-white border-blue-600' : 'bg-slate-100 text-slate-700 border-slate-200'
-            }`}>
+          <button onClick={() => { if (isHost) { setActiveTabPermissions('participants'); setShowPermissionsModal(true); } }} className="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 transition flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span>👥 {participants.length || 1}</span>
+          </button>
+
+          <button onClick={() => setShowChatPad(!showChatPad)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition ${showChatPad ? 'bg-blue-600 text-white border-blue-600' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
             💬 Chat {messages.length > 0 ? `(${messages.length})` : ''}
           </button>
 
-          <button
-            onClick={() => setShowNotesPad(!showNotesPad)}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition ${
-              showNotesPad ? 'bg-amber-100 text-amber-900 border-amber-300' : 'bg-slate-100 text-slate-700 border-slate-200'
-            }`}>
-            📝 Notes
+          <button onClick={() => setShowNotesPad(!showNotesPad)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition flex items-center gap-1 ${showNotesPad ? 'bg-amber-100 text-amber-900 border-amber-300' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
+            <span>📝 Notes</span>
+            <span className="text-[10px] opacity-70">🔒</span>
           </button>
 
-          <button
-            onClick={toggleMic}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition flex items-center gap-1 ${
-              isMicOn ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-700 border-slate-200'
-            }`}>
+          <button onClick={toggleMic} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition flex items-center gap-1 ${isMicOn ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
             {isMicOn ? '🎙️ Mic ON' : '📞 Voice'}
           </button>
 
           {isHost && (
-            <button
-              onClick={() => setShowPermissionsModal(true)}
-              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 text-slate-700 border border-slate-200 transition">
+            <button onClick={() => { setActiveTabPermissions('global'); setShowPermissionsModal(true); }} title="Room Permissions" className="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 text-slate-700 border border-slate-200 hover:bg-slate-200 transition">
               🛡️
             </button>
           )}
 
-          <button
-            onClick={copyInviteLink}
-            className="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-sm transition">
+          <button onClick={copyInviteLink} className="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-sm transition">
             {copiedLink ? '✓ Copied' : '🔗 Share'}
+          </button>
+
+          {/* Dynamic Leave vs Disable Room Button */}
+          <button onClick={handleLeaveOrDisableRoom} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition flex items-center gap-1 ${isOnlyOneInRoom && (isHost || isCoHost) ? 'bg-rose-600 hover:bg-rose-700 text-white shadow-sm' : 'bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200'}`}>
+            <span>{isOnlyOneInRoom && (isHost || isCoHost) ? '🗑️ Disable Room' : '🚪 Leave'}</span>
           </button>
         </div>
       </header>
 
-      {/* FIXED BOTTOM FLOATING WORKSPACE DOCK */}
+      {/* FIXED BOTTOM WORKSPACE DOCK */}
       <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-white/95 backdrop-blur-xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] border border-slate-200/90 rounded-2xl px-4 py-2 flex items-center gap-3 z-40">
         <div className="flex items-center gap-1 bg-slate-100 px-2 py-1 rounded-xl text-xs font-mono">
           <button onClick={() => handleZoom(-0.1)} className="hover:text-blue-600 font-bold px-1">−</button>
           <span>{Math.round(zoomScale * 100)}%</span>
           <button onClick={() => handleZoom(0.1)} className="hover:text-blue-600 font-bold px-1">+</button>
-          {(zoomScale !== 1 || panOffset.x !== 0 || panOffset.y !== 0) && (
-            <button onClick={handleResetZoom} className="text-[10px] text-blue-600 font-semibold ml-1">Reset</button>
-          )}
+          <button onClick={handleResetZoom} title="Reset zoom and position" className="ml-1 px-2 py-1 rounded-lg bg-white hover:bg-blue-50 text-[10px] font-bold text-slate-600 border border-slate-200">Reset</button>
         </div>
 
         <div className="h-6 w-[1px] bg-slate-200" />
 
-        {/* Move Tool, Pens, Highlighter & Magic Pen */}
         <div className="flex items-center gap-1">
-          {/* ✋ MOVE TOOL (Select & Drag drawings) */}
-          <button
-            onClick={() => { setTool('select'); setShowShapesMenu(false); }}
-            title="Move Tool: Click and drag any drawing to move it"
-            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-              tool === 'select' ? 'bg-blue-600 text-white shadow-sm font-bold scale-105' : 'hover:bg-slate-100 text-slate-700'
-            }`}>
+          <button onClick={() => { changeTool('select'); }} className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${tool === 'select' ? 'bg-blue-600 text-white shadow-sm font-bold scale-105' : 'hover:bg-slate-100 text-slate-700'}`}>
             ✋
           </button>
-
-          <button
-            onClick={() => { setTool('pencil'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
-            title="Pen"
-            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-              tool === 'pencil' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
-            }`}>
+          <button onClick={() => { changeTool('pencil'); }} className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${tool === 'pencil' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'}`}>
             ✏️
           </button>
-
-          <button
-            onClick={() => { setTool('highlighter'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
-            title="Highlighter: Transparent ink shows back text"
-            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-              tool === 'highlighter' ? 'bg-yellow-400 text-yellow-950 shadow-sm font-bold' : 'hover:bg-slate-100'
-            }`}>
+          <button onClick={() => { changeTool('highlighter'); }} className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${tool === 'highlighter' ? 'bg-yellow-400 text-yellow-950 shadow-sm font-bold' : 'hover:bg-slate-100'}`}>
             🖍️
           </button>
-
-          <button
-            onClick={() => { setTool('smart'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
-            title="Smart Pen: Auto converts rough ink to crisp shapes & alphanumeric text"
-            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-              tool === 'smart' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
-            }`}>
+          <button onClick={() => { changeTool('smart'); }} className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${tool === 'smart' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'}`}>
             ✨
           </button>
-
-          {/* ⚡ MAGIC PEN (Fades away in 1.5 seconds) */}
-          <button
-            onClick={() => { setTool('laser'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
-            title="Magic Pen: Automatically disappears in 1.5 seconds"
-            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-              tool === 'laser' ? 'bg-rose-600 text-white shadow-sm animate-pulse' : 'hover:bg-slate-100'
-            }`}>
+          <button onClick={() => { changeTool('laser'); }} className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${tool === 'laser' ? 'bg-rose-600 text-white shadow-sm animate-pulse' : 'hover:bg-slate-100'}`}>
             ⚡
           </button>
         </div>
 
         <div className="h-6 w-[1px] bg-slate-200" />
 
-        {/* Elements, Text & Sticky Notes */}
         <div className="flex items-center gap-1">
           <div className="relative">
-            <button
-              onClick={() => setShowShapesMenu(!showShapesMenu)}
-              title="Shapes"
-              className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-                isShapeActive ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
-              }`}>
+            <button onClick={() => setShowShapesMenu(!showShapesMenu)} className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${isShapeActive ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'}`}>
               ⬡
             </button>
-
             {showShapesMenu && (
               <div className="absolute bottom-12 left-0 bg-white border border-slate-200 rounded-xl shadow-2xl p-1.5 grid grid-cols-2 gap-1 w-36 z-50">
-                {[
-                  { id: 'rectangle', label: '▭ Box' },
-                  { id: 'circle', label: '⭕ Circle' },
-                  { id: 'line', label: '― Line' },
-                  { id: 'arrow', label: '➔ Arrow' },
-                  { id: 'triangle', label: '▲ Triangle' },
-                  { id: 'star', label: '★ Star' },
-                ].map((s) => (
-                  <button
-                    key={s.id}
-                    onClick={() => { setTool(s.id); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
-                    className={`px-2 py-1.5 rounded-lg text-xs font-medium text-left transition ${
-                      tool === s.id ? 'bg-blue-50 text-blue-600 font-bold' : 'hover:bg-slate-100'
-                    }`}>
+                {[{ id: 'rectangle', label: '▭ Box' }, { id: 'circle', label: '⭕ Circle' }, { id: 'line', label: '― Line' }, { id: 'arrow', label: '➔ Arrow' }, { id: 'triangle', label: '▲ Triangle' }, { id: 'star', label: '★ Star' }].map((s) => (
+                  <button key={s.id} onClick={() => { changeTool(s.id); }} className={`px-2 py-1.5 rounded-lg text-xs font-medium text-left transition ${tool === s.id ? 'bg-blue-50 text-blue-600 font-bold' : 'hover:bg-slate-100'}`}>
                     {s.label}
                   </button>
                 ))}
@@ -1720,140 +2430,93 @@ export default function App() {
             )}
           </div>
 
-          <button
-            onClick={() => { setTool('text'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
-            title="Text Box"
-            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm font-bold transition ${
-              tool === 'text' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
-            }`}>
+          <button onClick={() => { if (!canUserText) { alert('Text permission is disabled. Ask the host.'); return; } changeTool('text'); }} title="Text" className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm font-bold transition ${tool === 'text' ? 'bg-blue-600 text-white shadow-sm' : canUserText ? 'hover:bg-slate-100' : 'opacity-40 cursor-not-allowed'}`}>
             T
           </button>
-
-          <button
-            onClick={() => { setTool('sticky'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
-            title="Drop Sticky Note"
-            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-              tool === 'sticky' ? 'bg-yellow-400 text-yellow-950 shadow-sm' : 'hover:bg-slate-100'
-            }`}>
+          <button onClick={() => { changeTool('sticky'); }} className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${tool === 'sticky' ? 'bg-yellow-400 text-yellow-950 shadow-sm' : 'hover:bg-slate-100'}`}>
             📌
           </button>
         </div>
 
         <div className="h-6 w-[1px] bg-slate-200" />
 
-        {/* Upload Doc & OCR */}
         <div className="flex items-center gap-1">
           <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*,application/pdf" className="hidden" />
-          <button
-            onClick={() => fileInputRef.current.click()}
-            title="Upload Multi-page PDF or Worksheet"
-            className="w-8 h-8 rounded-xl flex items-center justify-center text-sm hover:bg-slate-100 transition">
-            📄
-          </button>
-          <button
-            onClick={() => { setTool('extract'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
-            title="OCR Extract text to Notes Pad"
-            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-              tool === 'extract' ? 'bg-purple-600 text-white shadow-sm' : 'hover:bg-slate-100'
-            }`}>
-            🔍
-          </button>
+          <button onClick={() => { if (!canUserUpload) { alert('File/PDF upload permission is disabled. Ask the host.'); return; } fileInputRef.current?.click(); }} title="Upload PDF/Image" className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${canUserUpload ? 'hover:bg-slate-100' : 'opacity-40 cursor-not-allowed'}`}>📄</button>
+          <button onClick={() => { changeTool('extract'); }} className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${tool === 'extract' ? 'bg-purple-600 text-white shadow-sm' : 'hover:bg-slate-100'}`}>🔍</button>
         </div>
 
         <div className="h-6 w-[1px] bg-slate-200" />
 
-        {/* Color Palette, Eraser & Actions */}
         <div className="flex items-center gap-2">
           <div className="relative">
-            <button
-              onClick={() => setShowColorPalette(!showColorPalette)}
-              className="w-6 h-6 rounded-full border-2 border-white shadow-sm ring-1 ring-slate-300"
-              style={{ backgroundColor: color }}
-            />
+            <button onClick={() => setShowColorPalette(!showColorPalette)} className="w-6 h-6 rounded-full border-2 border-white shadow-sm ring-1 ring-slate-300 hover:scale-105 transition" style={{ backgroundColor: color }} />
             {showColorPalette && (
-              <div className="absolute bottom-12 left-0 bg-white border border-slate-200 rounded-xl shadow-2xl p-2 grid grid-cols-4 gap-1.5 z-50">
-                {paletteColors.map((c) => (
-                  <button
-                    key={c}
-                    onClick={() => { setColor(c); setShowColorPalette(false); }}
-                    className="w-6 h-6 rounded-lg transition hover:scale-110"
-                    style={{ backgroundColor: c }}
-                  />
-                ))}
+              <div className="absolute bottom-12 left-0 bg-white border border-slate-200 rounded-2xl shadow-2xl p-3 w-64 z-50 select-none">
+                <div className="mb-2.5">
+                  <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Theme Colors</div>
+                  <div className="flex flex-col gap-1">
+                    {themePalette.map((row, rIdx) => (
+                      <div key={rIdx} className="grid grid-cols-10 gap-1">
+                        {row.map((c, cIdx) => (
+                          <button key={`${rIdx}-${cIdx}`} type="button" onClick={() => { selectColor(c); setShowColorPalette(false); }} style={{ backgroundColor: c }} className={`w-5 h-3.5 rounded-[2px] border transition hover:scale-125 ${color.toLowerCase() === c.toLowerCase() ? 'ring-2 ring-blue-600 border-white' : 'border-slate-200'}`} />
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
+                  <label className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-700 hover:text-blue-600 cursor-pointer">
+                    <input type="color" value={color} onChange={(e) => selectColor(e.target.value)} className="w-5 h-5 rounded border-0 cursor-pointer p-0" />
+                    <span>More Colors...</span>
+                  </label>
+                </div>
               </div>
             )}
           </div>
 
-          <input
-            type="range"
-            min="1"
-            max="12"
-            value={lineWidth}
-            onChange={(e) => setLineWidth(Number(e.target.value))}
-            className="w-16 accent-blue-600 cursor-pointer"
-          />
-
-          <button
-            onClick={() => { setTool('eraser'); setSelectedElementIndex(null); redrawCanvas(); setShowShapesMenu(false); }}
-            title="Eraser"
-            className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${
-              tool === 'eraser' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'
-            }`}>
-            🧹
-          </button>
-
-          <button onClick={clearCanvas} title="Clear Whiteboard" className="text-xs font-bold text-rose-500 hover:text-rose-700 ml-1">Clear</button>
+          <input type="range" min="1" max="12" value={lineWidth} onChange={(e) => setLineWidth(Number(e.target.value))} className="w-16 accent-blue-600 cursor-pointer" />
+          <button onClick={() => { changeTool('eraser'); }} className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition ${tool === 'eraser' ? 'bg-blue-600 text-white shadow-sm' : 'hover:bg-slate-100'}`}>🧹</button>
+          <button onClick={clearCanvas} className="text-xs font-bold text-rose-500 hover:text-rose-700 ml-1">Clear</button>
         </div>
       </div>
 
-      {/* SLIDES GALLERY DRAWER */}
+      {/* SLIDES DRAWER */}
       {showSlidesDrawer && (
         <div className="fixed top-16 left-6 w-80 max-h-[75vh] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-3">
             <span className="font-bold text-xs">📑 Snapped Slides ({savedSlides.length})</span>
-            <button onClick={() => setShowSlidesDrawer(false)} className="text-xs text-slate-400 font-bold hover:text-slate-600">✕</button>
+            <button onClick={() => setShowSlidesDrawer(false)} className="text-xs text-slate-400 font-bold">✕</button>
           </div>
-
-          {savedSlides.length === 0 ? (
-            <div className="text-center py-8 text-xs text-slate-400">No slides snapped yet. Click "📸 Snap" above!</div>
-          ) : (
-            <div className="overflow-y-auto space-y-2.5 pr-1 flex-1">
-              {savedSlides.map((slide) => (
-                <div key={slide.id} className="p-2 bg-slate-50 rounded-xl border border-slate-200 flex items-center gap-3">
-                  <img src={slide.dataUrl} alt={slide.title} className="w-16 h-12 object-cover rounded-lg border border-slate-200 bg-white" />
-                  <div className="flex-1">
-                    <div className="text-xs font-bold">{slide.title}</div>
-                    <div className="text-[10px] text-slate-400">{slide.timestamp}</div>
-                  </div>
-                  <button onClick={() => setSavedSlides((prev) => prev.filter((s) => s.id !== slide.id))} className="text-slate-400 hover:text-rose-600 text-xs px-1">✕</button>
+          <div className="overflow-y-auto space-y-2.5 pr-1 flex-1">
+            {savedSlides.map((slide) => (
+              <div key={slide.id} className="p-2 bg-slate-50 rounded-xl border border-slate-200 flex items-center gap-3">
+                <img src={slide.dataUrl} alt={slide.title} className="w-16 h-12 object-cover rounded-lg border bg-white" />
+                <div className="flex-1">
+                  <div className="text-xs font-bold">{slide.title}</div>
+                  <div className="text-[10px] text-slate-400">{slide.timestamp}</div>
                 </div>
-              ))}
-            </div>
-          )}
-
+                <button onClick={() => setSavedSlides((prev) => prev.filter((s) => s.id !== slide.id))} className="text-slate-400 hover:text-rose-600 text-xs px-1">✕</button>
+              </div>
+            ))}
+          </div>
           {savedSlides.length > 0 && (
             <div className="mt-3 pt-2 border-t border-slate-100 flex items-center gap-2">
-              <button onClick={exportSlidesToPdf} className="flex-1 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-sm transition">
-                Extract All as PDF
-              </button>
-              <button onClick={() => setSavedSlides([])} className="px-2.5 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl text-xs font-semibold transition">
-                Clear
-              </button>
+              <button onClick={exportSlidesToPdf} className="flex-1 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-sm transition">Extract All as PDF</button>
+              <button onClick={() => setSavedSlides([])} className="px-2.5 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl text-xs font-semibold transition">Clear</button>
             </div>
           )}
         </div>
       )}
 
-      {/* LIVE IN-ROOM CHAT DRAWER */}
+      {/* CHAT DRAWER */}
       {showChatPad && (
         <div className="fixed top-16 right-6 w-80 h-[480px] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-2">
-            <span className="font-bold text-xs flex items-center gap-1.5">💬 In-Room Chat</span>
-            <button onClick={() => setShowChatPad(false)} className="text-xs text-slate-400 font-bold hover:text-slate-600">✕</button>
+            <span className="font-bold text-xs">💬 In-Room Chat</span>
+            <button onClick={() => setShowChatPad(false)} className="text-xs text-slate-400 font-bold">✕</button>
           </div>
-
           <div className="flex-1 overflow-y-auto space-y-2 p-1 text-xs">
-            {messages.length === 0 && <div className="text-center py-12 text-slate-400 text-xs">No doubts yet. Ask a question!</div>}
             {messages.map((m) => (
               <div key={m.id} className="bg-slate-50 border border-slate-100 p-2 rounded-xl">
                 <div className="flex items-center justify-between mb-0.5">
@@ -1865,109 +2528,142 @@ export default function App() {
             ))}
             <div ref={chatBottomRef} />
           </div>
-
           <form onSubmit={sendChatMessage} className="mt-2 pt-2 border-t border-slate-100 flex gap-2">
-            <input
-              type="text"
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => e.stopPropagation()}
-              placeholder="Type doubt..."
-              className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs outline-none focus:ring-1 focus:ring-blue-500"
-            />
-            <button type="submit" className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-sm transition">
-              Send
-            </button>
+            <input type="text" value={chatInput} onChange={(e) => setChatInput(e.target.value)} onKeyDown={(e) => e.stopPropagation()} placeholder="Type doubt..." className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs outline-none focus:ring-1 focus:ring-blue-500" />
+            <button type="submit" className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-sm transition">Send</button>
           </form>
         </div>
       )}
 
-      {/* QUICK NOTES PANEL */}
+      {/* PRIVATE NOTES PANEL */}
       {showNotesPad && (
-        <div className="fixed top-16 right-6 w-80 bg-white/95 backdrop-blur shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
+        <div className="fixed top-16 right-6 w-84 bg-white/95 backdrop-blur shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-2">
-            <span className="font-bold text-xs">📝 Study Notes Pad</span>
-            <button onClick={() => setShowNotesPad(false)} className="text-xs text-slate-400 font-bold hover:text-slate-600">✕</button>
+            <span className="font-bold text-xs">📝 Private Study Notes</span>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-emerald-600 font-medium">● {notesSaveStatus}</span>
+              <button onClick={() => setShowNotesPad(false)} className="text-xs text-slate-400 font-bold">✕</button>
+            </div>
           </div>
+          <textarea value={privateNotes} onChange={(e) => savePrivateNotes(e.target.value)} onKeyDown={(e) => e.stopPropagation()} placeholder="Type personal notes..." className="w-full h-72 bg-slate-50/80 p-3 rounded-xl resize-none border border-slate-200 outline-none text-xs leading-relaxed font-mono select-text" />
+        </div>
+      )}
 
-          <textarea
-            value={sharedNotes}
-            onChange={handleNotesChange}
-            onKeyDown={(e) => e.stopPropagation()}
-            onPaste={(e) => e.stopPropagation()}
-            placeholder="Type or OCR-extract text here..."
-            className="w-full h-72 bg-slate-50/80 p-3 rounded-xl resize-none border border-slate-200 outline-none text-xs leading-relaxed font-mono select-text transition"
-          />
-
-          <div className="flex items-center justify-between mt-3 pt-2 border-t border-slate-100">
-            <button onClick={copyNotesToClipboard} className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 rounded-lg text-xs font-semibold transition">
-              {copySuccess ? '✓ Copied' : 'Copy'}
-            </button>
-            <button onClick={downloadNotesFile} className="px-3 py-1 bg-slate-900 text-white rounded-lg text-xs font-semibold shadow-sm transition">
-              💾 Save (.txt)
-            </button>
+      {showHostLeaveModal && isHost && participants.length > 1 && (
+        <div className="fixed inset-0 z-[80] bg-slate-900/45 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 p-5">
+            <div className="text-lg font-bold text-slate-900">Choose the new host</div>
+            <p className="text-xs text-slate-500 mt-1 mb-4">You need to hand over host access before leaving this room.</p>
+            <div className="space-y-2 max-h-64 overflow-auto">
+              {participants.filter((p) => p.clientId !== myClientId).map((p) => (
+                <button key={p.clientId} type="button" onClick={() => setSelectedHostSuccessor(p.clientId)} className={`w-full text-left p-3 rounded-xl border transition ${selectedHostSuccessor === p.clientId ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:bg-slate-50'}`}>
+                  <div className="font-semibold text-sm text-slate-800">{p.userName || 'Guest'}</div>
+                  <div className="text-[10px] text-slate-400 font-mono mt-0.5">{p.clientId}</div>
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-2 mt-5">
+              <button type="button" onClick={() => setShowHostLeaveModal(false)} className="flex-1 py-2.5 rounded-xl bg-slate-100 text-slate-700 text-xs font-bold">Cancel</button>
+              <button type="button" disabled={!selectedHostSuccessor} onClick={() => completeHostHandoffAndLeave(selectedHostSuccessor)} className="flex-1 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-xs font-bold">Make Host & Leave</button>
+            </div>
           </div>
         </div>
       )}
 
-      {/* HOST PERMISSIONS MODAL */}
+      {/* HOST PERMISSIONS & CO-HOST ASSIGNMENT MODAL */}
       {showPermissionsModal && isHost && (
-        <div className="fixed inset-0 bg-slate-900/30 backdrop-blur-sm flex items-center justify-center z-50">
-          <div className="bg-white border border-slate-200 rounded-2xl shadow-2xl p-6 w-96 max-w-[90vw]">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-4">
+        <div className="fixed inset-0 bg-slate-900/30 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-2xl p-6 w-full max-w-md max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
               <div>
-                <h3 className="font-bold text-sm text-slate-900">Room Permissions (Host)</h3>
-                <p className="text-[11px] text-slate-500">Control guest permissions across screens</p>
+                <h3 className="font-bold text-sm text-slate-900">Room Governance &amp; Co-Hosts</h3>
+                <p className="text-[11px] text-slate-500">Manage global permissions and co-hosts</p>
               </div>
-              <button onClick={() => setShowPermissionsModal(false)} className="text-slate-400 hover:text-slate-600 font-bold">✕</button>
+              <button onClick={() => setShowPermissionsModal(false)} className="text-slate-400 font-bold">✕</button>
             </div>
 
-            <div className="space-y-4 text-xs">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="font-semibold text-slate-800">Sync Zoom & Scroll Globally</div>
-                  <div className="text-[11px] text-slate-500">Guests mirror your document scroll & zoom</div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={permissions.syncZoomGlobally}
-                  onChange={(e) => updateHostPermission('syncZoomGlobally', e.target.checked)}
-                  className="w-4 h-4 accent-blue-600 rounded cursor-pointer"
-                />
-              </div>
-
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="font-semibold text-slate-800">Allow Guests to Draw</div>
-                  <div className="text-[11px] text-slate-500">Guests can write & draw shapes</div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={permissions.canDraw}
-                  onChange={(e) => updateHostPermission('canDraw', e.target.checked)}
-                  className="w-4 h-4 accent-blue-600 rounded cursor-pointer"
-                />
-              </div>
-
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="font-semibold text-slate-800">Show Guest Pointers</div>
-                  <div className="text-[11px] text-slate-500">Display laser mouse pointers</div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={permissions.canSharePointer}
-                  onChange={(e) => updateHostPermission('canSharePointer', e.target.checked)}
-                  className="w-4 h-4 accent-blue-600 rounded cursor-pointer"
-                />
-              </div>
+            <div className="flex rounded-xl bg-slate-100 p-1 mb-4">
+              <button onClick={() => setActiveTabPermissions('global')} className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition ${activeTabPermissions === 'global' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-600'}`}>Global Defaults</button>
+              <button onClick={() => setActiveTabPermissions('participants')} className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition ${activeTabPermissions === 'participants' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-600'}`}>Participants ({participants.length})</button>
             </div>
 
-            <button
-              onClick={() => setShowPermissionsModal(false)}
-              className="mt-6 w-full py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-semibold transition">
-              Apply Changes
-            </button>
+            <div className="flex-1 overflow-y-auto pr-1">
+              {activeTabPermissions === 'global' ? (
+                <div className="space-y-3.5 text-xs">
+                  <div className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-50">
+                    <div>
+                      <div className="font-semibold text-slate-800">Sync Zoom &amp; Scroll Globally</div>
+                    </div>
+                    <input type="checkbox" checked={permissions.syncZoomGlobally} onChange={(e) => updateHostPermission('syncZoomGlobally', e.target.checked)} className="w-4 h-4 accent-blue-600 rounded cursor-pointer" />
+                  </div>
+                  {[
+                    ['canDraw', 'Allow guests to Draw / Whiteboard'],
+                    ['canText', 'Allow guests to use Text'],
+                    ['canUpload', 'Allow guests to upload PDF / Images'],
+                    ['canVoiceChat', 'Allow guests to use Voice Call'],
+                    ['canSharePointer', 'Allow guests to share Pointer'],
+                  ].map(([key, label]) => (
+                    <div key={key} className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-50">
+                      <div className="font-semibold text-slate-800">{label}</div>
+                      <input type="checkbox" checked={Boolean(permissions[key])} onChange={(e) => updateHostPermission(key, e.target.checked)} className="w-4 h-4 accent-blue-600 rounded cursor-pointer" />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="space-y-2 text-xs">
+                  {participants.map((p) => {
+                    const isMe = p.clientId === myClientId;
+                    const isPeerCoHost = coHostIds.includes(p.clientId);
+
+                    return (
+                      <div key={p.clientId} className="flex items-center justify-between p-2.5 rounded-xl bg-slate-50 border border-slate-200/70">
+                        <div className="flex items-center gap-2.5">
+                          <div className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs ${p.isHost ? 'bg-amber-100 text-amber-800' : isPeerCoHost ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-700'}`}>
+                            {p.userName ? p.userName[0].toUpperCase() : 'U'}
+                          </div>
+                          <div>
+                            <div className="font-semibold text-xs text-slate-800 flex items-center gap-1.5">
+                              <span>{p.userName || 'Guest'}</span>
+                              {isMe && <span className="text-[10px] text-slate-400 font-normal">(You)</span>}
+                              {p.isHost && <span className="text-[9px] bg-amber-100 text-amber-800 px-1 py-0.2 rounded font-bold">Host</span>}
+                              {isPeerCoHost && <span className="text-[9px] bg-purple-100 text-purple-800 px-1 py-0.2 rounded font-bold">Co-Host</span>}
+                            </div>
+                          </div>
+                        </div>
+
+                        {!p.isHost && isHost && (
+                          <div className="mt-2 flex flex-wrap items-center justify-end gap-1.5">
+                            <button type="button" onClick={() => toggleCoHostStatus(p.clientId)} className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition ${isPeerCoHost ? 'bg-purple-600 text-white shadow-sm' : 'bg-slate-200 text-slate-700 hover:bg-slate-300'}`}>
+                              {isPeerCoHost ? '👑 Co-Host ON' : 'Make Co-Host'}
+                            </button>
+                            <button type="button" onClick={() => transferHost(p.clientId)} className="px-2.5 py-1 rounded-lg bg-amber-100 text-amber-800 hover:bg-amber-200 text-[10px] font-bold">Transfer Host</button>
+                            <button type="button" onClick={() => kickParticipant(p.clientId)} className="px-2.5 py-1 rounded-lg bg-rose-100 text-rose-700 hover:bg-rose-200 text-[10px] font-bold">Remove</button>
+                            <div className="w-full grid grid-cols-5 gap-1 mt-1">
+                              {[
+                                ['canDraw', 'Draw'],
+                                ['canText', 'Text'],
+                                ['canUpload', 'Upload'],
+                                ['canVoice', 'Voice'],
+                                ['canSharePointer', 'Pointer'],
+                              ].map(([key, label]) => {
+                                const current = participantOverrides[p.clientId] || { canDraw: null, canText: null, canUpload: null, canVoice: null, canSharePointer: null };
+                                return (
+                                  <button key={key} type="button" onClick={() => updateParticipantOverride(p.clientId, key, current[key] === null ? true : current[key] === true ? false : null)} className={`px-1.5 py-1 rounded-md text-[9px] font-bold border ${current[key] === null ? 'bg-slate-100 text-slate-500 border-slate-200' : current[key] ? 'bg-emerald-100 text-emerald-700 border-emerald-200' : 'bg-rose-50 text-rose-500 border-rose-200'}`}>
+                                    {label} {current[key] === null ? '↔' : current[key] ? '✓' : '×'}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <button onClick={() => setShowPermissionsModal(false)} className="mt-4 w-full py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-semibold transition">Done</button>
           </div>
         </div>
       )}
@@ -1978,121 +2674,68 @@ export default function App() {
         </div>
       )}
 
-      {isExtracting && (
-        <div className="fixed top-18 left-1/2 -translate-x-1/2 z-50 bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-semibold shadow-lg flex items-center gap-2">
-          <span>⚙️ Reading text from worksheet...</span>
-        </div>
-      )}
-
-      {/* Text Box Input */}
-      {textInput.visible && (
+      {textInput.visible && canUserText && (
         <div
+          className="fixed z-[60]"
           style={{
             left: `${textInput.x * zoomScale + panOffset.x}px`,
-            top: `${textInput.y * zoomScale + panOffset.y}px`,
-            transformOrigin: 'top left',
-            transform: `scale(${zoomScale})`,
+            top: `${textInput.y * zoomScale + panOffset.y + 56}px`,
           }}
-          className="absolute z-30 bg-white/90 p-1 rounded border border-blue-400 shadow-md">
-          <input
+        >
+          <textarea
             ref={textInputRef}
-            type="text"
             value={textInput.text}
-            onChange={(e) => setTextInput({ ...textInput, text: e.target.value })}
+            onChange={(e) => setTextInput((prev) => ({ ...prev, text: e.target.value }))}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') commitText();
-              if (e.key === 'Escape') setTextInput({ visible: false, x: 0, y: 0, text: '' });
+              e.stopPropagation();
+              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault();
+                commitText();
+              }
+              if (e.key === 'Escape') {
+                setTextInput({ visible: false, x: 0, y: 0, text: '' });
+              }
             }}
-            placeholder="Type text & hit Enter..."
-            style={{
-              color: color,
-              fontSize: `${Math.max(lineWidth * 5, 20)}px`,
-            }}
-            className="bg-transparent border-none outline-none font-semibold min-w-[200px]"
+            onBlur={commitText}
+            placeholder="Type text…"
+            rows={2}
+            className="w-56 min-h-16 resize-none bg-white border-2 border-blue-500 rounded-xl px-3 py-2 text-sm text-slate-900 shadow-xl outline-none select-text"
           />
-        </div>
-      )}
-
-      {/* Remote Cursor Pointer */}
-      {remoteCursor.visible && (
-        <div
-          style={{
-            transform: `translate(${remoteCursor.x * zoomScale + panOffset.x}px, ${
-              remoteCursor.y * zoomScale + panOffset.y
-            }px)`,
-            transition: 'transform 0.04s linear',
-          }}
-          className="absolute top-0 left-0 pointer-events-none z-30 flex items-center gap-1">
-          <svg className="w-4 h-4 text-blue-600 filter drop-shadow" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M3 2l18 9-9 3-4 8z" />
-          </svg>
-          <span className="bg-blue-600 text-white text-[10px] font-semibold px-1.5 py-0.5 rounded shadow">
-            {remoteCursor.name}
-          </span>
+          <div className="text-[9px] text-slate-500 mt-1 bg-white/90 px-2 py-1 rounded-md shadow-sm">Ctrl/Cmd + Enter to place • Esc to cancel</div>
         </div>
       )}
 
       {/* INFINITE EXPANDING CANVAS VIEWPORT */}
-      <div
-        ref={viewportRef}
-        className="absolute inset-0 w-screen h-screen overflow-hidden pt-14 cursor-crosshair z-0">
-        <div
-          style={{
-            transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`,
-            transformOrigin: 'top left',
-            width: `${CANVAS_WIDTH}px`,
-            height: `${CANVAS_HEIGHT}px`,
-          }}
-          className="relative top-0 left-0">
+      <div ref={viewportRef} className="absolute inset-0 w-screen h-screen overflow-hidden pt-14 cursor-crosshair z-0">
+        <div style={{ transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`, transformOrigin: 'top left', width: `${CANVAS_WIDTH}px`, height: `${CANVAS_HEIGHT}px` }} className="relative top-0 left-0">
           <canvas ref={bgCanvasRef} className="absolute top-0 left-0 pointer-events-none z-0 shadow-sm" />
-          <canvas
-            ref={drawCanvasRef}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseLeave}
-            className={`absolute top-0 left-0 z-10 ${
-              tool === 'select'
-                ? 'cursor-grab active:cursor-grabbing'
-                : tool === 'laser'
-                ? 'cursor-pointer'
-                : tool === 'highlighter'
-                ? 'cursor-crosshair'
-                : tool === 'sticky'
-                ? 'cursor-copy'
-                : !canUserDraw && tool !== 'extract'
-                ? 'cursor-not-allowed'
-                : tool === 'text'
-                ? 'cursor-text'
-                : tool === 'extract'
-                ? 'cursor-cell'
-                : 'cursor-crosshair'
-            }`}
-          />
-          {/* Laser canvas for magic pen 1.5s glow */}
+          <canvas ref={drawCanvasRef} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseLeave} className="absolute top-0 left-0 z-10" />
           <canvas ref={laserCanvasRef} className="absolute top-0 left-0 pointer-events-none z-20" />
 
-          {/* Sticky Notes */}
+          {Object.values(remoteCursors).map((cursor) => (
+            cursor?.visible && Number.isFinite(cursor.x) && Number.isFinite(cursor.y) ? (
+              <div
+                key={cursor.clientId}
+                className="absolute z-30 pointer-events-none transition-transform duration-75"
+                style={{ left: `${cursor.x}px`, top: `${cursor.y}px`, transform: 'translate(-2px, -2px)' }}
+              >
+                <div className="relative">
+                  <div className={`w-0 h-0 border-l-[7px] border-l-transparent border-r-[7px] border-r-transparent border-b-[16px] ${cursor.isHost ? 'border-b-amber-500' : 'border-b-blue-600'} rotate-[-28deg] drop-shadow-sm`} />
+                  <div className={`absolute left-3 top-3 whitespace-nowrap px-1.5 py-0.5 rounded-md text-[9px] font-bold text-white shadow-sm ${cursor.isHost ? 'bg-amber-500' : 'bg-blue-600'}`}>
+                    {cursor.isHost ? '👑 ' : ''}{cursor.name || 'Guest'}
+                  </div>
+                </div>
+              </div>
+            ) : null
+          ))}
+
           {stickyNotes.map((note) => (
-            <div
-              key={note.id}
-              style={{
-                left: `${note.x}px`,
-                top: `${note.y}px`,
-                backgroundColor: note.bgColor,
-              }}
-              className="absolute z-25 w-44 min-h-[110px] p-2.5 rounded-xl shadow-lg border border-yellow-300 text-slate-800 flex flex-col justify-between">
+            <div key={note.id} style={{ left: `${note.x}px`, top: `${note.y}px`, backgroundColor: note.bgColor }} className="absolute z-25 w-44 min-h-[110px] p-2.5 rounded-xl shadow-lg border border-yellow-300 text-slate-800 flex flex-col justify-between">
               <div className="flex justify-between items-center mb-1">
-                <span className="text-[10px] font-bold text-yellow-800 tracking-wider">📌 NOTE</span>
+                <span className="text-[10px] font-bold text-yellow-800">📌 NOTE</span>
                 <button onClick={() => deleteStickyNote(note.id)} className="text-xs font-bold text-yellow-800 hover:text-rose-600">✕</button>
               </div>
-              <textarea
-                defaultValue={note.text}
-                onBlur={(e) => updateStickyText(note.id, e.target.value)}
-                onKeyDown={(e) => e.stopPropagation()}
-                className="w-full bg-transparent resize-none border-none outline-none text-xs text-slate-800 leading-snug"
-                rows={3}
-              />
+              <textarea defaultValue={note.text} onBlur={(e) => updateStickyText(note.id, e.target.value)} onKeyDown={(e) => e.stopPropagation()} className="w-full bg-transparent resize-none border-none outline-none text-xs text-slate-800 leading-snug" rows={3} />
             </div>
           ))}
         </div>
