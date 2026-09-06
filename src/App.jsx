@@ -29,6 +29,7 @@ export default function App() {
   const remoteAudiosRef = useRef({}); // peerId -> HTMLAudioElement
   const pendingCandidatesRef = useRef({}); // peerId -> ICE candidates received before remoteDescription
   const makingOfferRef = useRef({}); // peerId -> offer in progress
+  const voiceRecoveryTimersRef = useRef({}); // peerId -> recovery timer
   const myClientId = useRef('user-' + Math.random().toString(36).substring(2, 9) + '-' + Date.now().toString(36).substring(4)).current;
 
   // Screen Recording
@@ -49,6 +50,8 @@ export default function App() {
   const [isCoHost, setIsCoHost] = useState(false); // Co-host state
   const [coHostIds, setCoHostIds] = useState([]); // List of co-host clientIds
   const [initialUrlRoom, setInitialUrlRoom] = useState('');
+  const autoRestoreAttemptedRef = useRef(false);
+  const leavingRoomRef = useRef(false);
   const [showPermissionsModal, setShowPermissionsModal] = useState(false);
   const [activeTabPermissions, setActiveTabPermissions] = useState('global'); // 'global' | 'participants'
   const [copiedLink, setCopiedLink] = useState(false);
@@ -295,6 +298,15 @@ export default function App() {
       panOffsetRef.current = { x: 0, y: 0 };
       zoomScaleRef.current = 1;
 
+      // Persist only the current room session so a browser refresh can stay
+      // inside the same room. Explicit Leave clears this data.
+      sessionStorage.setItem('studysync_active_session', JSON.stringify({
+        roomId: fullCode,
+        isHost: Boolean(hostStatus),
+        userName: name || '',
+        settings: settings || null,
+      }));
+
       setRoomId(fullCode);
       setIsHost(Boolean(hostStatus));
       setIsCoHost(false);
@@ -313,6 +325,43 @@ export default function App() {
       alert('Unable to start the session. Please try again.');
     }
   };
+
+
+  // Browser refresh must NOT send the user back to the home screen. Restore
+  // the exact room from the URL/session and let the normal realtime effect
+  // reconnect to Supabase. Explicit Leave removes this session first.
+  useEffect(() => {
+    if (autoRestoreAttemptedRef.current || isSessionActive) return;
+
+    const params = new URLSearchParams(window.location.search);
+    const urlRoom = params.get('room');
+    if (!urlRoom) return;
+
+    autoRestoreAttemptedRef.current = true;
+
+    let saved = null;
+    try {
+      saved = JSON.parse(sessionStorage.getItem('studysync_active_session') || 'null');
+    } catch (err) {}
+
+    const restoredRoom = String(urlRoom).trim().toLowerCase();
+    const restoredHost = params.get('host') === 'true';
+    const roomForRestore = saved?.roomId || restoredRoom;
+    const hostForRestore = typeof saved?.isHost === 'boolean' ? saved.isHost : restoredHost;
+    const nameForRestore = saved?.userName || (hostForRestore ? 'Host' : 'Guest');
+
+    // A refresh can happen before React has rendered anything. Re-enter the
+    // same room automatically instead of showing AuthRoomModal/home.
+    handleLaunchSession({
+      roomId: roomForRestore,
+      isHost: hostForRestore,
+      userName: nameForRestore,
+      settings: saved?.settings || undefined,
+    }).catch((err) => {
+      console.error('Room refresh restore failed:', err);
+      autoRestoreAttemptedRef.current = false;
+    });
+  }, [isSessionActive]);
 
   const completeHostHandoffAndLeave = async (targetClientId) => {
     if (!isHostRef.current || !targetClientId) return;
@@ -339,6 +388,7 @@ export default function App() {
   };
 
   const handleLeaveOrDisableRoom = async (skipPrompt = false) => {
+    leavingRoomRef.current = true;
     if (!skipPrompt && isHostRef.current && participants.length > 1) {
       setSelectedHostSuccessor('');
       setShowHostLeaveModal(true);
@@ -422,6 +472,9 @@ export default function App() {
     setIsCoHost(false);
     setCoHostIds([]);
     setRoomId('');
+    try { sessionStorage.removeItem('studysync_active_session'); } catch (err) {}
+    autoRestoreAttemptedRef.current = false;
+    leavingRoomRef.current = false;
     window.history.replaceState({}, '', window.location.pathname);
   };
 
@@ -484,12 +537,11 @@ export default function App() {
         if (key !== myClientId && isHostRef.current) {
           safeBroadcast('board-state', { to: key, elements: elementsRef.current });
         }
-        if (
-          key !== myClientId &&
-          localStreamRef.current?.getAudioTracks()?.[0]?.enabled &&
-          myClientId < key
-        ) {
-          negotiateWithPeer(key);
+        if (key !== myClientId) {
+          createPeerConnection(key);
+          if (myClientId < key) {
+            setTimeout(() => negotiateWithPeer(key), 50);
+          }
         }
       })
       .on('presence', { event: 'leave' }, ({ key }) => {
@@ -498,6 +550,10 @@ export default function App() {
           delete next[key];
           return next;
         });
+        if (voiceRecoveryTimersRef.current[key]) {
+          clearTimeout(voiceRecoveryTimersRef.current[key]);
+          delete voiceRecoveryTimersRef.current[key];
+        }
         if (peerConnectionsRef.current[key]) {
           peerConnectionsRef.current[key].close();
           delete peerConnectionsRef.current[key];
@@ -515,6 +571,26 @@ export default function App() {
           }
         });
         setParticipants(activeList);
+
+        // If this was the LAST participant, remove the room from Supabase.
+        // A short delay prevents a false delete during a refresh/reconnect.
+        if (activeList.length === 0) {
+          const roomToDelete = roomId.trim().toLowerCase();
+          setTimeout(async () => {
+            try {
+              const latestState = channel.presenceState();
+              const stillOccupied = Object.keys(latestState).some((k) =>
+                latestState[k]?.length > 0
+              );
+              if (stillOccupied) return;
+
+              await supabase.from('private_notes').delete().eq('room_id', roomToDelete);
+              await supabase.from('study_rooms').delete().eq('room_id', roomToDelete);
+            } catch (err) {
+              console.warn('Empty-room cleanup failed:', err);
+            }
+          }, 1200);
+        }
       })
       // IMPORTANT: drawings are merged by element ID. Replacing the whole
       // array caused one user's drawing to overwrite another user's drawing.
@@ -606,6 +682,7 @@ export default function App() {
         setParticipants([]);
         setIsCoHost(false);
         setCoHostIds([]);
+        try { sessionStorage.removeItem('studysync_active_session'); } catch (err) {}
         window.history.replaceState({}, '', window.location.pathname);
       })
       .on('broadcast', { event: 'host-transfer' }, ({ payload }) => {
@@ -643,8 +720,12 @@ export default function App() {
       .on('broadcast', { event: 'webrtc-renegotiate-request' }, ({ payload }) => {
         const fromPeerId = payload?.from;
         if (!fromPeerId || fromPeerId === myClientId) return;
-        if (myClientId < fromPeerId && localStreamRef.current?.getAudioTracks()?.[0]?.enabled) {
-          negotiateWithPeer(fromPeerId);
+        const pc = peerConnectionsRef.current[fromPeerId];
+        if (!pc || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+          createPeerConnection(fromPeerId);
+        }
+        if (myClientId < fromPeerId) {
+          setTimeout(() => negotiateWithPeer(fromPeerId), 80);
         }
       })
       .on('broadcast', { event: 'webrtc-offer' }, async ({ payload }) => {
@@ -657,8 +738,12 @@ export default function App() {
         if (!pc) return;
 
         try {
+          if (pc.signalingState !== 'have-local-offer') return;
           await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
           await flushPendingCandidates(payload.from, pc);
+          Object.values(remoteAudiosRef.current).forEach((audioEl) => {
+            if (audioEl?.srcObject) audioEl.play().catch(() => {});
+          });
         } catch (err) {
           console.warn('WebRTC answer error:', err);
         }
@@ -700,14 +785,15 @@ export default function App() {
 
           // Presence sync can contain peers that joined before this client.
           // The smaller client ID is the sole offer initiator.
-          if (localStreamRef.current?.getAudioTracks()?.[0]?.enabled) {
-            const state = channel.presenceState();
-            Object.keys(state).forEach((peerId) => {
-              if (peerId !== myClientId && myClientId < peerId) {
-                negotiateWithPeer(peerId);
+          const state = channel.presenceState();
+          Object.keys(state).forEach((peerId) => {
+            if (peerId !== myClientId) {
+              createPeerConnection(peerId);
+              if (myClientId < peerId) {
+                setTimeout(() => negotiateWithPeer(peerId), 50);
               }
-            });
-          }
+            }
+          });
         }
       });
 
@@ -720,6 +806,8 @@ export default function App() {
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => track.stop());
       }
+      Object.values(voiceRecoveryTimersRef.current).forEach((timer) => clearTimeout(timer));
+      voiceRecoveryTimersRef.current = {};
       Object.values(peerConnectionsRef.current).forEach((pc) => pc.close());
       peerConnectionsRef.current = {};
       Object.values(remoteAudiosRef.current).forEach((a) => {
@@ -1100,7 +1188,7 @@ export default function App() {
   // preview is never used as the stored board state. It recognizes lines,
   // arrows, circles, rectangles and triangles and otherwise keeps the exact
   // freehand stroke.
-  const recognizeAndDrawSmartShape = (rawPoints) => {
+  const recognizeAndDrawSmartShape = (rawPoints, shouldBroadcast = true) => {
     if (!Array.isArray(rawPoints) || rawPoints.length < 6) return false;
 
     const points = rawPoints
@@ -1146,7 +1234,9 @@ export default function App() {
     const commitShape = (el) => {
       elementsRef.current.push(el);
       redrawCanvas();
-      broadcastElement(el);
+      // A guest without Draw permission keeps the drawing locally on their
+      // own board, but it must not be sent to the shared room board.
+      if (shouldBroadcast) broadcastElement(el);
       return true;
     };
 
@@ -1445,13 +1535,18 @@ export default function App() {
     }
 
     audioEl.srcObject = stream;
-    const playPromise = audioEl.play();
-    if (playPromise?.catch) {
-      playPromise.catch(() => {
-        // Browser autoplay may require one user gesture. The Voice button
-        // provides that gesture; retry on the next interaction if necessary.
-      });
-    }
+    const tryPlay = () => {
+      if (audioEl.srcObject) audioEl.play().catch(() => {});
+    };
+    audioEl.onloadedmetadata = tryPlay;
+    audioEl.oncanplay = tryPlay;
+    stream.getAudioTracks().forEach((track) => {
+      track.onunmute = tryPlay;
+    });
+    tryPlay();
+    // A few browsers delay remote audio until the media pipeline becomes
+    // active. Retry briefly without requiring another mic click.
+    [100, 300, 700, 1500].forEach((delay) => setTimeout(tryPlay, delay));
   };
 
   const flushPendingCandidates = async (peerId, pc) => {
@@ -1469,25 +1564,25 @@ export default function App() {
   };
 
   const createPeerConnection = (targetPeerId) => {
-    if (peerConnectionsRef.current[targetPeerId]) {
-      return peerConnectionsRef.current[targetPeerId];
-    }
+    if (!targetPeerId || targetPeerId === myClientId) return null;
+
+    const existing = peerConnectionsRef.current[targetPeerId];
+    if (existing && existing.connectionState !== 'closed') return existing;
 
     const pc = new RTCPeerConnection(rtcConfig);
     pendingCandidatesRef.current[targetPeerId] = pendingCandidatesRef.current[targetPeerId] || [];
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        channelRef.current?.send({
-          type: 'broadcast',
-          event: 'webrtc-candidate',
-          payload: {
-            from: myClientId,
-            to: targetPeerId,
-            candidate: event.candidate,
-          },
-        });
-      }
+      if (!event.candidate || !channelReadyRef.current) return;
+      channelRef.current?.send({
+        type: 'broadcast',
+        event: 'webrtc-candidate',
+        payload: {
+          from: myClientId,
+          to: targetPeerId,
+          candidate: event.candidate,
+        },
+      });
     };
 
     pc.ontrack = (event) => {
@@ -1496,23 +1591,71 @@ export default function App() {
     };
 
     pc.onconnectionstatechange = () => {
-      if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) {
-        if (pc.connectionState !== 'disconnected') {
+      const connectedPeerExists = Object.entries(peerConnectionsRef.current).some(
+        ([peerId, connection]) =>
+          peerId !== targetPeerId && connection?.connectionState === 'connected'
+      ) || pc.connectionState === 'connected';
+
+      setIsVoiceConnected(connectedPeerExists);
+
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        // Mobile networks/Wi-Fi can briefly disconnect ICE. Do not destroy a
+        // healthy connection immediately; rebuild it only if it stays broken.
+        if (!voiceRecoveryTimersRef.current[targetPeerId]) {
+          const delay = pc.connectionState === 'failed' ? 500 : 2000;
+          voiceRecoveryTimersRef.current[targetPeerId] = setTimeout(() => {
+            delete voiceRecoveryTimersRef.current[targetPeerId];
+
+            if (peerConnectionsRef.current[targetPeerId] !== pc) return;
+            if (pc.connectionState === 'connected' || pc.connectionState === 'connecting') return;
+
+            try { pc.close(); } catch (err) {}
+            delete peerConnectionsRef.current[targetPeerId];
+            delete makingOfferRef.current[targetPeerId];
+            delete pendingCandidatesRef.current[targetPeerId];
+
+            if (remoteAudiosRef.current[targetPeerId]) {
+              remoteAudiosRef.current[targetPeerId].srcObject = null;
+            }
+
+            // Ask the deterministic initiator (smaller client id) to create
+            // a fresh offer. This works even if only the receiver noticed the
+            // network failure.
+            createPeerConnection(targetPeerId);
+            channelRef.current?.send({
+              type: 'broadcast',
+              event: 'webrtc-renegotiate-request',
+              payload: { from: myClientId },
+            });
+            if (myClientId < targetPeerId) {
+              setTimeout(() => negotiateWithPeer(targetPeerId), 150);
+            }
+          }, delay);
+        }
+      }
+
+      if (pc.connectionState === 'closed') {
+        if (voiceRecoveryTimersRef.current[targetPeerId]) {
+          clearTimeout(voiceRecoveryTimersRef.current[targetPeerId]);
+          delete voiceRecoveryTimersRef.current[targetPeerId];
+        }
+        if (peerConnectionsRef.current[targetPeerId] === pc) {
           delete peerConnectionsRef.current[targetPeerId];
         }
+        delete makingOfferRef.current[targetPeerId];
       }
     };
 
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        const alreadyAdded = pc.getSenders().some((sender) => sender.track?.kind === track.kind);
-        if (!alreadyAdded) pc.addTrack(track, localStreamRef.current);
+    // One permanent audio m-line per peer. It stays sendrecv even when the
+    // local mic is OFF, so either side can receive audio immediately.
+    let audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    pc.__studysyncAudioTransceiver = audioTransceiver;
+
+    const localTrack = localStreamRef.current?.getAudioTracks?.()[0];
+    if (localTrack && audioTransceiver.sender) {
+      audioTransceiver.sender.replaceTrack(localTrack).catch((err) => {
+        console.warn('Initial audio track attach failed:', err);
       });
-    } else {
-      // Keep an audio receiving path ready even before this user turns on mic.
-      try {
-        pc.addTransceiver('audio', { direction: 'recvonly' });
-      } catch (err) {}
     }
 
     peerConnectionsRef.current[targetPeerId] = pc;
@@ -1520,7 +1663,13 @@ export default function App() {
   };
 
   const negotiateWithPeer = async (targetPeerId) => {
+    if (!targetPeerId || targetPeerId === myClientId) return;
+    // Smaller client ID is the only offer initiator. This removes offer/offer
+    // collisions when two people join or toggle their microphones together.
+    if (myClientId > targetPeerId) return;
+
     const pc = createPeerConnection(targetPeerId);
+    if (!pc || pc.connectionState === 'closed') return;
     if (makingOfferRef.current[targetPeerId]) return;
     if (pc.signalingState !== 'stable') return;
 
@@ -1528,6 +1677,7 @@ export default function App() {
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      if (!pc.localDescription) return;
 
       channelRef.current?.send({
         type: 'broadcast',
@@ -1546,15 +1696,17 @@ export default function App() {
   };
 
   const handleReceiveOffer = async (fromPeerId, offer) => {
+    if (!fromPeerId || fromPeerId === myClientId || !offer) return;
+    // Larger ID is the answerer only.
+    if (myClientId < fromPeerId) return;
+
     try {
       const pc = createPeerConnection(fromPeerId);
+      if (!pc) return;
 
-      // Deterministic negotiation: only the lexicographically smaller client
-      // is allowed to initiate. If the larger client sends an offer anyway,
-      // ignore it instead of creating an offer collision.
-      if (myClientId < fromPeerId) return;
-
-      if (pc.signalingState !== 'stable') return;
+      if (pc.signalingState !== 'stable') {
+        return;
+      }
 
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       await flushPendingCandidates(fromPeerId, pc);
@@ -1577,25 +1729,34 @@ export default function App() {
   };
 
   const requestVoiceNegotiation = () => {
+    // Tell every peer that the audio sender state may have changed.
     channelRef.current?.send({
       type: 'broadcast',
       event: 'webrtc-renegotiate-request',
       payload: { from: myClientId },
     });
 
-    Object.keys(peerConnectionsRef.current).forEach((peerId) => {
-      if (myClientId < peerId) negotiateWithPeer(peerId);
+    participants.forEach((peer) => {
+      const peerId = peer?.clientId;
+      if (!peerId || peerId === myClientId) return;
+      if (myClientId < peerId) {
+        negotiateWithPeer(peerId);
+      }
     });
   };
 
   const startVoiceChat = async () => {
     if (!canUserVoice) {
-      alert('Microphone permissions disabled.');
+      alert('Microphone permission is disabled. Ask the host.');
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      alert('Microphone is not available in this browser. Use HTTPS or localhost.');
       return;
     }
 
     try {
-      // Reuse an existing stream instead of opening a second microphone.
       if (!localStreamRef.current) {
         localStreamRef.current = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -1608,23 +1769,33 @@ export default function App() {
       }
 
       const stream = localStreamRef.current;
+      const audioTrack = stream.getAudioTracks()[0];
+      if (!audioTrack) throw new Error('No microphone audio track was created.');
+      audioTrack.enabled = true;
 
-      stream.getAudioTracks().forEach((track) => {
-        track.enabled = true;
-        Object.entries(peerConnectionsRef.current).forEach(([peerId, pc]) => {
-          const audioSender = pc.getSenders().find((sender) => sender.track?.kind === 'audio');
-          if (audioSender) {
-            audioSender.replaceTrack(track);
-          } else {
-            pc.addTrack(track, stream);
-          }
-        });
-      });
+      // Attach the SAME microphone track to exactly one sender per peer.
+      for (const peer of participants) {
+        const peerId = peer?.clientId;
+        if (!peerId || peerId === myClientId) continue;
+
+        const pc = createPeerConnection(peerId);
+        if (!pc) continue;
+
+        const transceiver = pc.__studysyncAudioTransceiver || pc.getTransceivers().find(
+          (t) => t.receiver?.track?.kind === 'audio'
+        );
+
+        if (transceiver?.sender) {
+          await transceiver.sender.replaceTrack(audioTrack);
+        }
+      }
 
       setIsMicOn(true);
-      setIsVoiceConnected(true);
+      setIsVoiceConnected(
+        Object.values(peerConnectionsRef.current).some((pc) => pc?.connectionState === 'connected')
+      );
 
-      channelRef.current?.track({
+      await channelRef.current?.track({
         clientId: myClientId,
         userName: userName || (isHost ? 'Host' : 'Guest'),
         isHost,
@@ -1633,12 +1804,11 @@ export default function App() {
         permissions: userPermissions,
       });
 
-      // Build one connection per other participant and negotiate from the
-      // deterministic initiator side. Also ask the smaller-ID peer to
-      // renegotiate if the larger-ID peer just enabled its microphone.
+      // This also handles peers who joined before/after the mic was enabled.
       participants.forEach((peer) => {
-        if (!peer.clientId || peer.clientId === myClientId) return;
-        createPeerConnection(peer.clientId);
+        if (peer?.clientId && peer.clientId !== myClientId) {
+          createPeerConnection(peer.clientId);
+        }
       });
       requestVoiceNegotiation();
     } catch (err) {
@@ -1668,7 +1838,8 @@ export default function App() {
     audioTrack.enabled = newEnabled;
     setIsMicOn(newEnabled);
 
-    channelRef.current?.track({
+    // Keep presence in sync so every participant sees the correct mic state.
+    await channelRef.current?.track({
       clientId: myClientId,
       userName: userName || (isHost ? 'Host' : 'Guest'),
       isHost,
@@ -1677,7 +1848,11 @@ export default function App() {
       permissions: userPermissions,
     });
 
-    if (newEnabled) requestVoiceNegotiation();
+    if (newEnabled) {
+      // Track is already attached to every peer's sender. Renegotiation makes
+      // sure a peer that joined while our mic was off receives it too.
+      requestVoiceNegotiation();
+    }
   };
 
   useEffect(() => {
@@ -1699,6 +1874,50 @@ export default function App() {
     };
     img.src = dataUrl;
   };
+
+  // Load the two browser-side engines on demand so PDF upload and the
+  // Extract -> Private Study Notes workflow work even when index.html does not
+  // already include their CDN script tags.
+  const loadExternalScript = (src, globalName) => new Promise((resolve, reject) => {
+    if (window[globalName]) { resolve(window[globalName]); return; }
+    const existing = document.querySelector(`script[data-studysync-src="${src}"]`);
+    if (existing) {
+      existing.addEventListener('load', () => resolve(window[globalName]));
+      existing.addEventListener('error', reject);
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.dataset.studysyncSrc = src;
+    script.onload = () => window[globalName] ? resolve(window[globalName]) : reject(new Error(`${globalName} did not load`));
+    script.onerror = () => reject(new Error(`Failed to load ${globalName}`));
+    document.head.appendChild(script);
+  });
+
+  const ensurePdfJs = () => loadExternalScript(
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+    'pdfjsLib'
+  );
+
+  const ensureTesseract = () => loadExternalScript(
+    'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js',
+    'Tesseract'
+  );
+
+  const ensureJsPdf = () => loadExternalScript(
+    'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+    'jspdf'
+  );
+
+  useEffect(() => {
+    if (!isSessionActive) return;
+    // Preload quietly; the actual buttons still show a useful error if a CDN
+    // is blocked/offline.
+    ensurePdfJs().catch(() => {});
+    ensureTesseract().catch(() => {});
+    ensureJsPdf().catch(() => {});
+  }, [isSessionActive]);
 
   const renderPdfSinglePage = async (pdf, targetPage, broadcast = true) => {
     try {
@@ -1737,13 +1956,17 @@ export default function App() {
       const fileReader = new FileReader();
       fileReader.onload = async function () {
         const typedarray = new Uint8Array(this.result);
-        if (window.pdfjsLib) {
-          window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-          const pdf = await window.pdfjsLib.getDocument(typedarray).promise;
+        try {
+          const pdfjs = await ensurePdfJs();
+          pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+          const pdf = await pdfjs.getDocument({ data: typedarray }).promise;
           pdfDocRef.current = pdf;
           setNumPages(pdf.numPages);
           setPageNum(1);
-          renderPdfSinglePage(pdf, 1, true);
+          await renderPdfSinglePage(pdf, 1, true);
+        } catch (err) {
+          console.error('PDF load error:', err);
+          alert('Could not open this PDF. Check your internet connection and try again.');
         }
       };
       fileReader.readAsArrayBuffer(file);
@@ -1833,6 +2056,67 @@ export default function App() {
     setTimeout(() => setNotesSaveStatus('Saved'), 2000);
   };
 
+  // Save Private Study Notes directly as a real PDF file.
+  // No print dialog: jsPDF creates the PDF and browser downloads it to the
+  // user's configured Downloads folder automatically.
+  const saveNotesAsPdf = async () => {
+    const notes = (privateNotes || '').trim();
+    if (!notes) {
+      alert('There are no study notes to save yet.');
+      return;
+    }
+
+    try {
+      await ensureJsPdf();
+      const JsPdfCtor = window.jspdf?.jsPDF;
+      if (!JsPdfCtor) throw new Error('PDF engine did not load.');
+
+      const doc = new JsPdfCtor({
+        orientation: 'portrait',
+        unit: 'mm',
+        format: 'a4',
+      });
+
+      const margin = 18;
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
+      const usableWidth = pageWidth - margin * 2;
+      let y = margin;
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(18);
+      doc.text('Private Study Notes', margin, y);
+      y += 7;
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(9);
+      doc.setTextColor(100, 116, 139);
+      doc.text(`StudySync  •  ${new Date().toLocaleString()}`, margin, y);
+      y += 9;
+
+      doc.setTextColor(15, 23, 42);
+      doc.setFontSize(11);
+      const lines = doc.splitTextToSize(notes, usableWidth);
+      const lineHeight = 5.5;
+
+      lines.forEach((line) => {
+        if (y > pageHeight - margin) {
+          doc.addPage();
+          y = margin;
+        }
+        doc.text(String(line), margin, y);
+        y += lineHeight;
+      });
+
+      const safeRoom = String(roomId || 'room').replace(/[^a-z0-9_-]/gi, '_');
+      const date = new Date().toISOString().slice(0, 10);
+      doc.save(`StudySync-Private-Notes-${safeRoom}-${date}.pdf`);
+    } catch (err) {
+      console.error('Private notes PDF save error:', err);
+      alert('Could not create the PDF. Please try again after the PDF engine loads.');
+    }
+  };
+
   const extractTextFromRegion = async (x1, y1, x2, y2) => {
     const minX = Math.min(x1, x2);
     const minY = Math.min(y1, y2);
@@ -1840,11 +2124,6 @@ export default function App() {
     const height = Math.abs(y2 - y1);
 
     if (width < 10 || height < 10) return;
-    if (!window.Tesseract) {
-      alert('OCR Engine loading...');
-      return;
-    }
-
     setIsExtracting(true);
     try {
       const bgCanvas = bgCanvasRef.current;
@@ -1854,7 +2133,8 @@ export default function App() {
       const cropCtx = cropCanvas.getContext('2d');
       cropCtx.drawImage(bgCanvas, minX, minY, width, height, 0, 0, width, height);
 
-      const result = await window.Tesseract.recognize(cropCanvas, 'eng');
+      const tesseract = await ensureTesseract();
+      const result = await tesseract.recognize(cropCanvas, 'eng');
       const extractedText = result.data.text.trim();
 
       if (extractedText) {
@@ -1863,6 +2143,8 @@ export default function App() {
         setShowNotesPad(true);
       }
     } catch (err) {
+      console.error('Text extraction error:', err);
+      alert('Text extraction failed. Please make a slightly larger selection and try again.');
     } finally {
       setIsExtracting(false);
     }
@@ -1897,11 +2179,21 @@ export default function App() {
     setTextInput({ visible: false, x: 0, y: 0, text: '' });
   };
 
+  // Convert screen coordinates to the actual 4000x2500 canvas coordinate system.
+  // IMPORTANT: use the transformed canvas bounding rect itself. The old code used
+  // the viewport rect, which ignored the viewport's top padding and could produce
+  // a visible ~1 inch drawing offset, especially on mobile / zoomed canvases.
   const getCanvasCoords = (e) => {
-    const rect = viewportRef.current.getBoundingClientRect();
+    const canvas = drawCanvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = rect.width / canvas.width || zoomScale || 1;
+    const scaleY = rect.height / canvas.height || zoomScale || 1;
+
     return {
-      x: (e.clientX - rect.left - panOffset.x) / zoomScale,
-      y: (e.clientY - rect.top - panOffset.y) / zoomScale,
+      x: Math.max(0, Math.min(canvas.width, (e.clientX - rect.left) / scaleX)),
+      y: Math.max(0, Math.min(canvas.height, (e.clientY - rect.top) / scaleY)),
     };
   };
 
@@ -1964,9 +2256,9 @@ export default function App() {
       return;
     }
 
-    // Guests who are not granted Draw permission may doodle locally,
-    // but their stroke is never added to shared elements or broadcast.
-    // Hosts/co-hosts and permitted guests are shared normally.
+    // Guests without Draw permission may still draw locally. Their drawing is
+    // kept in the local element list so it survives redraws/tool changes, but
+    // it is never broadcast until they are permitted.
     if (!canUserDraw && tool !== 'extract') {
       if (['pencil', 'eraser', 'highlighter', 'smart'].includes(tool)) {
         setIsDrawing(true);
@@ -2124,15 +2416,22 @@ export default function App() {
   useEffect(() => {
     if (!isSessionActive) return;
 
+    // Pointer events work for mouse, touch and stylus. Keeping a window-level
+    // release prevents a stroke from getting stuck when the finger/mouse leaves
+    // the canvas before release.
     const releasePointer = (event) => {
-      if (isDrawing) handleMouseUp(event);
+      if (isDrawingRef.current) handleMouseUp(event);
     };
 
-    window.addEventListener('mouseup', releasePointer);
-    return () => window.removeEventListener('mouseup', releasePointer);
-  }, [isSessionActive, isDrawing, tool]);
+    window.addEventListener('pointerup', releasePointer);
+    window.addEventListener('pointercancel', releasePointer);
+    return () => {
+      window.removeEventListener('pointerup', releasePointer);
+      window.removeEventListener('pointercancel', releasePointer);
+    };
+  }, [isSessionActive, tool]);
 
-  const handleMouseLeave = () => {
+  const handleMouseLeave = (e) => {
     const canSendPointer = isHost || isCoHost || (userPermissions.canSharePointer ?? permissions.canSharePointer);
     if (canSendPointer && (isHost || isCoHost || shareMyPointer)) {
       channelRef.current?.send({
@@ -2141,7 +2440,9 @@ export default function App() {
         payload: { clientId: myClientId, x: -100, y: -100, visible: false, name: '' },
       });
     }
-    handleMouseUp();
+    // Pointer capture keeps touch/stylus drawing alive even when the finger
+    // crosses the canvas boundary. Do not finish a touch stroke on pointerleave.
+    if (e?.pointerType !== 'touch' && !e?.pointerType) handleMouseUp(e);
   };
 
   const handleMouseUp = (e) => {
@@ -2178,14 +2479,10 @@ export default function App() {
       const strokePoints = [...currentStrokeRef.current];
       currentStrokeRef.current = [];
 
-      // Unpermitted guest strokes are local-only and disappear on release.
-      if (isLocalOnlyStroke) {
-        if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
-        return;
-      }
-
+      // Unpermitted guests still get the full Auto-correct experience on
+      // their own board. The resulting element is simply not broadcast.
       if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
-      const corrected = recognizeAndDrawSmartShape(strokePoints);
+      const corrected = recognizeAndDrawSmartShape(strokePoints, !isLocalOnlyStroke);
 
       // If the stroke is not confidently recognizable as a shape, Smart Pen
       // must behave like a normal pen instead of silently deleting the stroke.
@@ -2202,7 +2499,7 @@ export default function App() {
         };
         elementsRef.current.push(fallback);
         redrawCanvas();
-        broadcastElement(fallback);
+        if (!isLocalOnlyStroke) broadcastElement(fallback);
       }
       return;
     }
@@ -2210,12 +2507,9 @@ export default function App() {
     if (['pencil', 'eraser', 'highlighter'].includes(tool)) {
       drawCtxRef.current.closePath();
 
-      if (isLocalOnlyStroke) {
-        if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
-        currentStrokeRef.current = [];
-        return;
-      }
-
+      // Permission controls sharing, not whether the guest can draw on
+      // their own canvas. Store local-only strokes in the same canonical
+      // element list so they survive tool changes and redraws.
       const newElement = {
         id: makeElementId('stroke'),
         type: 'stroke',
@@ -2224,13 +2518,14 @@ export default function App() {
         width: lineWidth,
         isHighlighter: tool === 'highlighter',
         isEraser: tool === 'eraser',
+        localOnly: isLocalOnlyStroke,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
       elementsRef.current.push(newElement);
       currentStrokeRef.current = [];
       redrawCanvas();
-      broadcastElement(newElement);
+      if (!isLocalOnlyStroke) broadcastElement(newElement);
     } else {
       if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
       const newElement = {
@@ -2293,14 +2588,41 @@ export default function App() {
   const isOnlyOneInRoom = participants.length <= 1;
 
   return (
-    <div className="relative w-screen h-screen overflow-hidden select-none font-['Inter',sans-serif] bg-slate-100 text-slate-800">
+    <div className="relative w-screen h-[100dvh] overflow-hidden select-none font-['Inter',sans-serif] bg-slate-100 text-slate-800 studysync-app" style={{ touchAction: 'none' }}>
+      <style>{`
+        .studysync-app, .studysync-app * { -webkit-tap-highlight-color: transparent; }
+        .studysync-header { overflow-x: auto; scrollbar-width: none; }
+        .studysync-header::-webkit-scrollbar, .studysync-dock::-webkit-scrollbar { display: none; }
+        .studysync-header > div { flex-shrink: 0; }
+        .studysync-dock { max-width: calc(100vw - 24px); overflow-x: auto; overflow-y: visible; scrollbar-width: none; }
+        .studysync-dock > div { flex-shrink: 0; }
+        @media (max-width: 768px) {
+          .studysync-header { height: 56px; padding-left: 8px; padding-right: 8px; justify-content: flex-start; gap: 10px; }
+          .studysync-header > div { gap: 6px; }
+          .studysync-header button { min-height: 38px; }
+          .studysync-header .font-mono { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+          .studysync-dock { left: 8px; right: 8px; bottom: max(8px, env(safe-area-inset-bottom)); transform: none; max-width: none; width: auto; padding: 6px 8px; border-radius: 16px; gap: 8px; justify-content: flex-start; }
+          .studysync-dock button { touch-action: manipulation; }
+          .studysync-panel { left: 12px !important; right: 12px !important; width: auto !important; max-width: none !important; }
+          .studysync-slides-panel { max-height: 62vh; }
+          .studysync-chat-panel { height: min(480px, 68vh) !important; }
+          .studysync-notes-panel { max-height: 72vh; }
+          .studysync-notes-panel textarea { height: min(46vh, 360px) !important; }
+        }
+        @media (max-width: 420px) {
+          .studysync-header .studysync-brand-name { display: none; }
+          .studysync-header { gap: 7px; }
+          .studysync-dock { max-width: none; }
+        }
+      `}</style>
+
       {/* FIXED TOP HEADER */}
-      <header className="fixed top-0 left-0 right-0 h-14 bg-white/95 backdrop-blur-md border-b border-slate-200 px-5 flex items-center justify-between z-40 shadow-sm">
+      <header className="fixed top-0 left-0 right-0 h-14 bg-white/95 backdrop-blur-md border-b border-slate-200 px-5 flex items-center justify-between z-40 shadow-sm studysync-header">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white font-black text-sm shadow-sm">
             S
           </div>
-          <span className="font-bold text-sm tracking-tight text-slate-900">StudySync</span>
+          <span className="font-bold text-sm tracking-tight text-slate-900 studysync-brand-name">StudySync</span>
           <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isHost ? 'bg-blue-100 text-blue-700' : isCoHost ? 'bg-purple-100 text-purple-700' : 'bg-slate-100 text-slate-600'}`}>
             {isHost ? 'Host' : isCoHost ? 'Co-Host' : 'Guest'}
           </span>
@@ -2384,7 +2706,7 @@ export default function App() {
       </header>
 
       {/* FIXED BOTTOM WORKSPACE DOCK */}
-      <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-white/95 backdrop-blur-xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] border border-slate-200/90 rounded-2xl px-4 py-2 flex items-center gap-3 z-40">
+      <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-white/95 backdrop-blur-xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] border border-slate-200/90 rounded-2xl px-4 py-2 flex items-center gap-3 z-40 studysync-dock">
         <div className="flex items-center gap-1 bg-slate-100 px-2 py-1 rounded-xl text-xs font-mono">
           <button onClick={() => handleZoom(-0.1)} className="hover:text-blue-600 font-bold px-1">−</button>
           <span>{Math.round(zoomScale * 100)}%</span>
@@ -2483,7 +2805,7 @@ export default function App() {
 
       {/* SLIDES DRAWER */}
       {showSlidesDrawer && (
-        <div className="fixed top-16 left-6 w-80 max-h-[75vh] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
+        <div className="fixed top-16 left-6 w-80 max-h-[75vh] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col studysync-panel studysync-slides-panel">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-3">
             <span className="font-bold text-xs">📑 Snapped Slides ({savedSlides.length})</span>
             <button onClick={() => setShowSlidesDrawer(false)} className="text-xs text-slate-400 font-bold">✕</button>
@@ -2511,7 +2833,7 @@ export default function App() {
 
       {/* CHAT DRAWER */}
       {showChatPad && (
-        <div className="fixed top-16 right-6 w-80 h-[480px] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
+        <div className="fixed top-16 right-6 w-80 h-[480px] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col studysync-panel studysync-chat-panel">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-2">
             <span className="font-bold text-xs">💬 In-Room Chat</span>
             <button onClick={() => setShowChatPad(false)} className="text-xs text-slate-400 font-bold">✕</button>
@@ -2537,12 +2859,21 @@ export default function App() {
 
       {/* PRIVATE NOTES PANEL */}
       {showNotesPad && (
-        <div className="fixed top-16 right-6 w-84 bg-white/95 backdrop-blur shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
+        <div className="fixed top-16 right-6 w-84 bg-white/95 backdrop-blur shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col studysync-panel studysync-notes-panel">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-2">
             <span className="font-bold text-xs">📝 Private Study Notes</span>
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] text-emerald-600 font-medium">● {notesSaveStatus}</span>
-              <button onClick={() => setShowNotesPad(false)} className="text-xs text-slate-400 font-bold">✕</button>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-emerald-600 font-medium mr-1">● {notesSaveStatus}</span>
+              <button
+                type="button"
+                onClick={saveNotesAsPdf}
+                disabled={!privateNotes.trim()}
+                title="Save notes as PDF"
+                className="px-2 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-[10px] font-semibold text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                📄 PDF
+              </button>
+              <button onClick={() => setShowNotesPad(false)} className="text-xs text-slate-400 font-bold ml-0.5">✕</button>
             </div>
           </div>
           <textarea value={privateNotes} onChange={(e) => savePrivateNotes(e.target.value)} onKeyDown={(e) => e.stopPropagation()} placeholder="Type personal notes..." className="w-full h-72 bg-slate-50/80 p-3 rounded-xl resize-none border border-slate-200 outline-none text-xs leading-relaxed font-mono select-text" />
@@ -2706,10 +3037,35 @@ export default function App() {
       )}
 
       {/* INFINITE EXPANDING CANVAS VIEWPORT */}
-      <div ref={viewportRef} className="absolute inset-0 w-screen h-screen overflow-hidden pt-14 cursor-crosshair z-0">
+      <div ref={viewportRef} className="absolute inset-0 w-screen h-[100dvh] overflow-hidden pt-14 cursor-crosshair z-0" style={{ touchAction: 'none' }}>
         <div style={{ transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`, transformOrigin: 'top left', width: `${CANVAS_WIDTH}px`, height: `${CANVAS_HEIGHT}px` }} className="relative top-0 left-0">
           <canvas ref={bgCanvasRef} className="absolute top-0 left-0 pointer-events-none z-0 shadow-sm" />
-          <canvas ref={drawCanvasRef} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseLeave} className="absolute top-0 left-0 z-10" />
+          <canvas
+            ref={drawCanvasRef}
+            onPointerDown={(e) => {
+              // Do not let the browser pan/zoom/scroll the page while drawing.
+              e.preventDefault();
+              e.currentTarget.setPointerCapture?.(e.pointerId);
+              handleMouseDown(e);
+            }}
+            onPointerMove={(e) => {
+              e.preventDefault();
+              handleMouseMove(e);
+            }}
+            onPointerUp={(e) => {
+              e.preventDefault();
+              e.currentTarget.releasePointerCapture?.(e.pointerId);
+              handleMouseUp(e);
+            }}
+            onPointerCancel={(e) => {
+              e.preventDefault();
+              e.currentTarget.releasePointerCapture?.(e.pointerId);
+              handleMouseUp(e);
+            }}
+            onPointerLeave={handleMouseLeave}
+            style={{ touchAction: 'none', WebkitUserSelect: 'none', userSelect: 'none' }}
+            className="absolute top-0 left-0 z-10 touch-none"
+          />
           <canvas ref={laserCanvasRef} className="absolute top-0 left-0 pointer-events-none z-20" />
 
           {Object.values(remoteCursors).map((cursor) => (
