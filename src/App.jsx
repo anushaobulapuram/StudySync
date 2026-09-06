@@ -3,6 +3,30 @@ import React, { useRef, useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
 import AuthRoomModal from './AuthRoomModal';
 
+const mobileUiStyles = `
+  * { box-sizing: border-box; }
+  html, body, #root { width: 100%; max-width: 100%; margin: 0; overflow-x: hidden; }
+  .studysync-app { height: 100dvh; min-height: 100dvh; overflow: hidden; }
+  .studysync-dock { touch-action: pan-x; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; scrollbar-width: none; max-width: calc(100vw - 20px); }
+  .studysync-dock::-webkit-scrollbar { display: none; }
+  .studysync-dock > div { flex-shrink: 0; }
+  .studysync-dock button { flex: 0 0 auto; min-width: 32px; touch-action: manipulation; }
+  .studysync-board-canvas { touch-action: none; -webkit-user-select: none; user-select: none; }
+  @media (max-width: 768px) {
+    .studysync-header { height: 56px !important; padding-left: 10px !important; padding-right: 10px !important; overflow-x: auto; touch-action: pan-x; }
+    .studysync-header > div { flex-shrink: 0; }
+    .studysync-dock {
+      left: 8px !important; right: 8px !important; bottom: max(8px, env(safe-area-inset-bottom)) !important;
+      transform: none !important; width: auto !important; max-width: none !important;
+      justify-content: flex-start !important; overflow-x: auto !important; overflow-y: visible !important;
+      padding: 6px 8px !important; gap: 7px !important; border-radius: 16px !important; z-index: 60 !important;
+    }
+    .studysync-panel { left: 10px !important; right: 10px !important; top: 64px !important; max-height: calc(100dvh - 124px) !important; width: auto !important; }
+    .studysync-notes-panel { left: 10px !important; right: 10px !important; width: auto !important; max-width: none !important; bottom: calc(70px + env(safe-area-inset-bottom)) !important; top: auto !important; max-height: 68dvh !important; }
+    .studysync-notes-panel textarea { height: min(42dvh, 320px) !important; }
+    .studysync-dock { padding-bottom: max(6px, env(safe-area-inset-bottom)) !important; }
+  }
+`;
 export default function App() {
   const bgCanvasRef = useRef(null);
   const drawCanvasRef = useRef(null);
@@ -29,7 +53,6 @@ export default function App() {
   const remoteAudiosRef = useRef({}); // peerId -> HTMLAudioElement
   const pendingCandidatesRef = useRef({}); // peerId -> ICE candidates received before remoteDescription
   const makingOfferRef = useRef({}); // peerId -> offer in progress
-  const voiceRecoveryTimersRef = useRef({}); // peerId -> recovery timer
   const myClientId = useRef('user-' + Math.random().toString(36).substring(2, 9) + '-' + Date.now().toString(36).substring(4)).current;
 
   // Screen Recording
@@ -50,8 +73,6 @@ export default function App() {
   const [isCoHost, setIsCoHost] = useState(false); // Co-host state
   const [coHostIds, setCoHostIds] = useState([]); // List of co-host clientIds
   const [initialUrlRoom, setInitialUrlRoom] = useState('');
-  const autoRestoreAttemptedRef = useRef(false);
-  const leavingRoomRef = useRef(false);
   const [showPermissionsModal, setShowPermissionsModal] = useState(false);
   const [activeTabPermissions, setActiveTabPermissions] = useState('global'); // 'global' | 'participants'
   const [copiedLink, setCopiedLink] = useState(false);
@@ -110,6 +131,43 @@ export default function App() {
   const makeElementId = (kind = 'element') =>
     `${myClientId}-${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
+  const cloneElements = (items = elementsRef.current) =>
+    items.map((el) => ({
+      ...el,
+      points: Array.isArray(el.points) ? el.points.map((p) => ({ ...p })) : el.points,
+    }));
+
+  const pushUndoSnapshot = () => {
+    undoStackRef.current.push(cloneElements());
+    if (undoStackRef.current.length > HISTORY_LIMIT) undoStackRef.current.shift();
+    redoStackRef.current = [];
+    setHistoryVersion((v) => v + 1);
+  };
+
+  const broadcastBoardReplace = (elements) => {
+    safeBroadcast('board-replace', { elements: cloneElements(elements) }, { queue: true });
+  };
+
+  const undoBoard = () => {
+    if (!canUserDraw || undoStackRef.current.length === 0) return;
+    redoStackRef.current.push(cloneElements());
+    elementsRef.current = undoStackRef.current.pop() || [];
+    setSelectedElementId(null);
+    redrawCanvas();
+    broadcastBoardReplace(elementsRef.current);
+    setHistoryVersion((v) => v + 1);
+  };
+
+  const redoBoard = () => {
+    if (!canUserDraw || redoStackRef.current.length === 0) return;
+    undoStackRef.current.push(cloneElements());
+    elementsRef.current = redoStackRef.current.pop() || [];
+    setSelectedElementId(null);
+    redrawCanvas();
+    broadcastBoardReplace(elementsRef.current);
+    setHistoryVersion((v) => v + 1);
+  };
+
   const mergeRemoteElements = (incoming = []) => {
     if (!Array.isArray(incoming) || incoming.length === 0) return;
     const byId = new Map(elementsRef.current.map((el) => [String(el.id), el]));
@@ -157,19 +215,8 @@ export default function App() {
   // Infinite Scroll & Zoom Viewport
   const [zoomScale, setZoomScale] = useState(1);
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
-  // Device-independent board scale: 100% means the same board proportions
-  // on phone, tablet and laptop. User zoom is applied on top of this fit scale.
-  const [boardFitScale, setBoardFitScale] = useState(1);
-  const boardFitScaleRef = useRef(1);
   const panOffsetRef = useRef({ x: 0, y: 0 });
   const zoomScaleRef = useRef(1);
-
-  // Mobile two-finger navigation. One finger remains drawing/selecting;
-  // two fingers exclusively control zoom + pan so PDF/document gestures never
-  // create accidental strokes.
-  const activeTouchPointersRef = useRef(new Map());
-  const pinchGestureRef = useRef(null);
-  const suppressTouchDrawingRef = useRef(false);
 
   // Strict Private Notes State (100% private, never broadcasted, persistent)
   const [showNotesPad, setShowNotesPad] = useState(false);
@@ -207,6 +254,18 @@ export default function App() {
   // Text state
   const [textInput, setTextInput] = useState({ visible: false, x: 0, y: 0, text: '' });
   const textInputRef = useRef(null);
+
+  // Local board history (remote changes never enter this history)
+  const undoStackRef = useRef([]);
+  const redoStackRef = useRef([]);
+  const HISTORY_LIMIT = 100;
+  const [, setHistoryVersion] = useState(0);
+
+  // Lightweight vector preview: avoids copying/redrawing the huge 4000x10000
+  // canvas on every finger movement.
+  const [previewPoints, setPreviewPoints] = useState([]);
+  const [previewShape, setPreviewShape] = useState(null);
+  const activePointerIdsRef = useRef(new Set());
 
   const rtcConfig = {
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
@@ -246,22 +305,6 @@ export default function App() {
   useEffect(() => {
     zoomScaleRef.current = zoomScale;
   }, [zoomScale]);
-
-  useEffect(() => {
-    const updateBoardFitScale = () => {
-      const width = Math.max(320, window.innerWidth || 320);
-      const next = Math.min(1, Number((width / 4000).toFixed(6)));
-      boardFitScaleRef.current = next;
-      setBoardFitScale(next);
-    };
-    updateBoardFitScale();
-    window.addEventListener('resize', updateBoardFitScale);
-    window.visualViewport?.addEventListener('resize', updateBoardFitScale);
-    return () => {
-      window.removeEventListener('resize', updateBoardFitScale);
-      window.visualViewport?.removeEventListener('resize', updateBoardFitScale);
-    };
-  }, []);
 
   useEffect(() => { isHostRef.current = isHost; }, [isHost]);
   useEffect(() => { isCoHostRef.current = isCoHost; }, [isCoHost]);
@@ -309,6 +352,8 @@ export default function App() {
       // Every room starts from a clean client-side workspace. Nothing from
       // the previous room is allowed to leak into the new room.
       elementsRef.current = [];
+      undoStackRef.current = [];
+      redoStackRef.current = [];
       laserPointsRef.current = [];
       boardOutboxRef.current = [];
       currentStrokeRef.current = [];
@@ -324,15 +369,6 @@ export default function App() {
       setPanOffset({ x: 0, y: 0 });
       panOffsetRef.current = { x: 0, y: 0 };
       zoomScaleRef.current = 1;
-
-      // Persist only the current room session so a browser refresh can stay
-      // inside the same room. Explicit Leave clears this data.
-      sessionStorage.setItem('studysync_active_session', JSON.stringify({
-        roomId: fullCode,
-        isHost: Boolean(hostStatus),
-        userName: name || '',
-        settings: settings || null,
-      }));
 
       setRoomId(fullCode);
       setIsHost(Boolean(hostStatus));
@@ -352,43 +388,6 @@ export default function App() {
       alert('Unable to start the session. Please try again.');
     }
   };
-
-
-  // Browser refresh must NOT send the user back to the home screen. Restore
-  // the exact room from the URL/session and let the normal realtime effect
-  // reconnect to Supabase. Explicit Leave removes this session first.
-  useEffect(() => {
-    if (autoRestoreAttemptedRef.current || isSessionActive) return;
-
-    const params = new URLSearchParams(window.location.search);
-    const urlRoom = params.get('room');
-    if (!urlRoom) return;
-
-    autoRestoreAttemptedRef.current = true;
-
-    let saved = null;
-    try {
-      saved = JSON.parse(sessionStorage.getItem('studysync_active_session') || 'null');
-    } catch (err) {}
-
-    const restoredRoom = String(urlRoom).trim().toLowerCase();
-    const restoredHost = params.get('host') === 'true';
-    const roomForRestore = saved?.roomId || restoredRoom;
-    const hostForRestore = typeof saved?.isHost === 'boolean' ? saved.isHost : restoredHost;
-    const nameForRestore = saved?.userName || (hostForRestore ? 'Host' : 'Guest');
-
-    // A refresh can happen before React has rendered anything. Re-enter the
-    // same room automatically instead of showing AuthRoomModal/home.
-    handleLaunchSession({
-      roomId: roomForRestore,
-      isHost: hostForRestore,
-      userName: nameForRestore,
-      settings: saved?.settings || undefined,
-    }).catch((err) => {
-      console.error('Room refresh restore failed:', err);
-      autoRestoreAttemptedRef.current = false;
-    });
-  }, [isSessionActive]);
 
   const completeHostHandoffAndLeave = async (targetClientId) => {
     if (!isHostRef.current || !targetClientId) return;
@@ -415,7 +414,6 @@ export default function App() {
   };
 
   const handleLeaveOrDisableRoom = async (skipPrompt = false) => {
-    leavingRoomRef.current = true;
     if (!skipPrompt && isHostRef.current && participants.length > 1) {
       setSelectedHostSuccessor('');
       setShowHostLeaveModal(true);
@@ -481,6 +479,8 @@ export default function App() {
 
     // 7. Reset session state
     elementsRef.current = [];
+    undoStackRef.current = [];
+    redoStackRef.current = [];
     laserPointsRef.current = [];
     currentStrokeRef.current = [];
     setStickyNotes([]);
@@ -499,9 +499,6 @@ export default function App() {
     setIsCoHost(false);
     setCoHostIds([]);
     setRoomId('');
-    try { sessionStorage.removeItem('studysync_active_session'); } catch (err) {}
-    autoRestoreAttemptedRef.current = false;
-    leavingRoomRef.current = false;
     window.history.replaceState({}, '', window.location.pathname);
   };
 
@@ -564,11 +561,12 @@ export default function App() {
         if (key !== myClientId && isHostRef.current) {
           safeBroadcast('board-state', { to: key, elements: elementsRef.current });
         }
-        if (key !== myClientId) {
-          createPeerConnection(key);
-          if (myClientId < key) {
-            setTimeout(() => negotiateWithPeer(key), 50);
-          }
+        if (
+          key !== myClientId &&
+          localStreamRef.current?.getAudioTracks()?.[0]?.enabled &&
+          myClientId < key
+        ) {
+          negotiateWithPeer(key);
         }
       })
       .on('presence', { event: 'leave' }, ({ key }) => {
@@ -577,10 +575,6 @@ export default function App() {
           delete next[key];
           return next;
         });
-        if (voiceRecoveryTimersRef.current[key]) {
-          clearTimeout(voiceRecoveryTimersRef.current[key]);
-          delete voiceRecoveryTimersRef.current[key];
-        }
         if (peerConnectionsRef.current[key]) {
           peerConnectionsRef.current[key].close();
           delete peerConnectionsRef.current[key];
@@ -598,26 +592,6 @@ export default function App() {
           }
         });
         setParticipants(activeList);
-
-        // If this was the LAST participant, remove the room from Supabase.
-        // A short delay prevents a false delete during a refresh/reconnect.
-        if (activeList.length === 0) {
-          const roomToDelete = roomId.trim().toLowerCase();
-          setTimeout(async () => {
-            try {
-              const latestState = channel.presenceState();
-              const stillOccupied = Object.keys(latestState).some((k) =>
-                latestState[k]?.length > 0
-              );
-              if (stillOccupied) return;
-
-              await supabase.from('private_notes').delete().eq('room_id', roomToDelete);
-              await supabase.from('study_rooms').delete().eq('room_id', roomToDelete);
-            } catch (err) {
-              console.warn('Empty-room cleanup failed:', err);
-            }
-          }, 1200);
-        }
       })
       // IMPORTANT: drawings are merged by element ID. Replacing the whole
       // array caused one user's drawing to overwrite another user's drawing.
@@ -659,6 +633,12 @@ export default function App() {
       })
       .on('broadcast', { event: 'clear-board' }, () => {
         elementsRef.current = [];
+        redrawCanvas();
+      })
+      .on('broadcast', { event: 'board-replace' }, ({ payload }) => {
+        if (!Array.isArray(payload?.elements)) return;
+        elementsRef.current = cloneElements(payload.elements);
+        setSelectedElementId(null);
         redrawCanvas();
       })
       .on('broadcast', { event: 'cursor-move' }, ({ payload }) => {
@@ -709,7 +689,6 @@ export default function App() {
         setParticipants([]);
         setIsCoHost(false);
         setCoHostIds([]);
-        try { sessionStorage.removeItem('studysync_active_session'); } catch (err) {}
         window.history.replaceState({}, '', window.location.pathname);
       })
       .on('broadcast', { event: 'host-transfer' }, ({ payload }) => {
@@ -747,12 +726,8 @@ export default function App() {
       .on('broadcast', { event: 'webrtc-renegotiate-request' }, ({ payload }) => {
         const fromPeerId = payload?.from;
         if (!fromPeerId || fromPeerId === myClientId) return;
-        const pc = peerConnectionsRef.current[fromPeerId];
-        if (!pc || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-          createPeerConnection(fromPeerId);
-        }
-        if (myClientId < fromPeerId) {
-          setTimeout(() => negotiateWithPeer(fromPeerId), 80);
+        if (myClientId < fromPeerId && localStreamRef.current?.getAudioTracks()?.[0]?.enabled) {
+          negotiateWithPeer(fromPeerId);
         }
       })
       .on('broadcast', { event: 'webrtc-offer' }, async ({ payload }) => {
@@ -765,12 +740,8 @@ export default function App() {
         if (!pc) return;
 
         try {
-          if (pc.signalingState !== 'have-local-offer') return;
           await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
           await flushPendingCandidates(payload.from, pc);
-          Object.values(remoteAudiosRef.current).forEach((audioEl) => {
-            if (audioEl?.srcObject) audioEl.play().catch(() => {});
-          });
         } catch (err) {
           console.warn('WebRTC answer error:', err);
         }
@@ -812,15 +783,14 @@ export default function App() {
 
           // Presence sync can contain peers that joined before this client.
           // The smaller client ID is the sole offer initiator.
-          const state = channel.presenceState();
-          Object.keys(state).forEach((peerId) => {
-            if (peerId !== myClientId) {
-              createPeerConnection(peerId);
-              if (myClientId < peerId) {
-                setTimeout(() => negotiateWithPeer(peerId), 50);
+          if (localStreamRef.current?.getAudioTracks()?.[0]?.enabled) {
+            const state = channel.presenceState();
+            Object.keys(state).forEach((peerId) => {
+              if (peerId !== myClientId && myClientId < peerId) {
+                negotiateWithPeer(peerId);
               }
-            }
-          });
+            });
+          }
         }
       });
 
@@ -833,8 +803,6 @@ export default function App() {
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => track.stop());
       }
-      Object.values(voiceRecoveryTimersRef.current).forEach((timer) => clearTimeout(timer));
-      voiceRecoveryTimersRef.current = {};
       Object.values(peerConnectionsRef.current).forEach((pc) => pc.close());
       peerConnectionsRef.current = {};
       Object.values(remoteAudiosRef.current).forEach((a) => {
@@ -979,7 +947,12 @@ export default function App() {
         maxY = Math.max(maxY, p.y);
       });
     } else if (el.type === 'shape') {
-      if (el.shapeTool === 'circle' || el.shapeTool === 'star') {
+      if (el.shapeTool === 'circle') {
+        minX = Math.min(el.fromX, el.toX);
+        maxX = Math.max(el.fromX, el.toX);
+        minY = Math.min(el.fromY, el.toY);
+        maxY = Math.max(el.fromY, el.toY);
+      } else if (el.shapeTool === 'star') {
         const radius = Math.hypot(el.toX - el.fromX, el.toY - el.fromY);
         minX = el.fromX - radius;
         maxX = el.fromX + radius;
@@ -1037,8 +1010,7 @@ export default function App() {
 
       if (e.ctrlKey || e.metaKey) {
         const zoomFactor = e.deltaY < 0 ? 1.05 : 0.95;
-        const newScale = Math.min(Math.max(Number((zoomScaleRef.current * zoomFactor).toFixed(2)), 0.5), 2.5);
-        zoomScaleRef.current = newScale;
+        const newScale = Math.min(Math.max(Number((zoomScaleRef.current * zoomFactor).toFixed(2)), 0.3), 3.0);
         setZoomScale(newScale);
 
         if ((isHost || isCoHost) && permissions.syncZoomGlobally) {
@@ -1216,7 +1188,7 @@ export default function App() {
   // preview is never used as the stored board state. It recognizes lines,
   // arrows, circles, rectangles and triangles and otherwise keeps the exact
   // freehand stroke.
-  const recognizeAndDrawSmartShape = (rawPoints, shouldBroadcast = true) => {
+  const recognizeAndDrawSmartShape = (rawPoints) => {
     if (!Array.isArray(rawPoints) || rawPoints.length < 6) return false;
 
     const points = rawPoints
@@ -1262,9 +1234,7 @@ export default function App() {
     const commitShape = (el) => {
       elementsRef.current.push(el);
       redrawCanvas();
-      // A guest without Draw permission keeps the drawing locally on their
-      // own board, but it must not be sent to the shared room board.
-      if (shouldBroadcast) broadcastElement(el);
+      broadcastElement(el);
       return true;
     };
 
@@ -1344,6 +1314,29 @@ export default function App() {
       }
     }
 
+
+    // 3) Star: recognize a closed 5-point star by looking for alternating
+    // outer/inner radial peaks around the stroke's center.
+    if (closed && boxW > 24 && boxH > 24) {
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      const radial = points.map((p) => Math.hypot(p.x - centerX, p.y - centerY));
+      const avgR = radial.reduce((a, b) => a + b, 0) / radial.length;
+      const outer = avgR * 1.18;
+      const inner = avgR * 0.78;
+      let transitions = 0;
+      let wasOuter = radial[0] > outer;
+      for (let i = 1; i < radial.length; i++) {
+        const nowOuter = radial[i] > outer;
+        if (nowOuter !== wasOuter) transitions++;
+        wasOuter = nowOuter;
+      }
+      const aspect = Math.min(boxW, boxH) / Math.max(boxW, boxH);
+      if (aspect > 0.55 && transitions >= 7) {
+        return commitShape(makeShape('star', centerX, centerY, centerX, centerY + avgR));
+      }
+    }
+
     // 3) Closed polygons. Simplify aggressively enough to ignore hand shake,
     // but not so aggressively that a triangle becomes a line.
     if (closed && boxW > 18 && boxH > 18) {
@@ -1396,9 +1389,8 @@ export default function App() {
     merged.height = window.innerHeight;
     const mCtx = merged.getContext('2d');
 
-    const renderScale = Math.max(0.0001, boardFitScale * zoomScale);
-    mCtx.drawImage(bgCanvas, -panOffset.x / renderScale, -panOffset.y / renderScale, window.innerWidth / renderScale, window.innerHeight / renderScale, 0, 0, window.innerWidth, window.innerHeight);
-    mCtx.drawImage(drawCanvas, -panOffset.x / renderScale, -panOffset.y / renderScale, window.innerWidth / renderScale, window.innerHeight / renderScale, 0, 0, window.innerWidth, window.innerHeight);
+    mCtx.drawImage(bgCanvas, -panOffset.x / zoomScale, -panOffset.y / zoomScale, window.innerWidth / zoomScale, window.innerHeight / zoomScale, 0, 0, window.innerWidth, window.innerHeight);
+    mCtx.drawImage(drawCanvas, -panOffset.x / zoomScale, -panOffset.y / zoomScale, window.innerWidth / zoomScale, window.innerHeight / zoomScale, 0, 0, window.innerWidth, window.innerHeight);
 
     const dataUrl = merged.toDataURL('image/png');
     const newSlide = {
@@ -1517,37 +1509,16 @@ export default function App() {
     });
   };
 
-  const applyZoomAtPoint = (nextScale, clientX, clientY) => {
-    const next = Math.max(0.5, Math.min(2.5, Number(nextScale.toFixed(2))));
-    const canvas = drawCanvasRef.current;
-    const currentScale = Math.max(0.0001, boardFitScaleRef.current * zoomScaleRef.current);
-    const nextRenderScale = Math.max(0.0001, boardFitScaleRef.current * next);
-    const currentPan = panOffsetRef.current;
-
-    if (canvas && currentScale > 0) {
-      const rect = canvas.getBoundingClientRect();
-      const originX = rect.left - currentPan.x;
-      const originY = rect.top - currentPan.y;
-      const worldX = (clientX - rect.left) / currentScale;
-      const worldY = (clientY - rect.top) / currentScale;
-      const nextPan = {
-        x: clientX - originX - worldX * nextRenderScale,
-        y: clientY - originY - worldY * nextRenderScale,
-      };
-      panOffsetRef.current = nextPan;
-      setPanOffset(nextPan);
-    }
-
-    zoomScaleRef.current = next;
-    setZoomScale(next);
-  };
-
   const handleZoom = (delta) => {
-    const viewport = viewportRef.current;
-    const rect = viewport?.getBoundingClientRect();
-    const focusX = rect ? rect.left + rect.width / 2 : window.innerWidth / 2;
-    const focusY = rect ? rect.top + rect.height / 2 : window.innerHeight / 2;
-    applyZoomAtPoint(zoomScaleRef.current + delta, focusX, focusY);
+    const newScale = Math.min(Math.max(Number((zoomScaleRef.current + delta).toFixed(2)), 0.3), 3.0);
+    setZoomScale(newScale);
+    if (isHost && permissions.syncZoomGlobally) {
+      channelRef.current?.send({
+        type: 'broadcast',
+        event: 'sync-view',
+        payload: { scale: newScale, pan: panOffsetRef.current },
+      });
+    }
   };
 
   const handleResetZoom = () => {
@@ -1555,9 +1526,6 @@ export default function App() {
     setPanOffset({ x: 0, y: 0 });
     panOffsetRef.current = { x: 0, y: 0 };
     zoomScaleRef.current = 1;
-    pinchGestureRef.current = null;
-    activeTouchPointersRef.current.clear();
-    suppressTouchDrawingRef.current = false;
     if (isHost && permissions.syncZoomGlobally) {
       channelRef.current?.send({
         type: 'broadcast',
@@ -1566,6 +1534,22 @@ export default function App() {
       });
     }
   };
+
+  useEffect(() => {
+    const retryRemoteAudio = () => {
+      Object.values(remoteAudiosRef.current).forEach((audio) => {
+        if (audio?.srcObject) audio.play().catch(() => {});
+      });
+    };
+    window.addEventListener('pointerdown', retryRemoteAudio, { passive: true });
+    window.addEventListener('touchstart', retryRemoteAudio, { passive: true });
+    window.addEventListener('keydown', retryRemoteAudio);
+    return () => {
+      window.removeEventListener('pointerdown', retryRemoteAudio);
+      window.removeEventListener('touchstart', retryRemoteAudio);
+      window.removeEventListener('keydown', retryRemoteAudio);
+    };
+  }, []);
 
   const ensureRemoteAudio = (peerId, stream) => {
     let audioEl = remoteAudiosRef.current[peerId];
@@ -1588,18 +1572,13 @@ export default function App() {
     }
 
     audioEl.srcObject = stream;
-    const tryPlay = () => {
-      if (audioEl.srcObject) audioEl.play().catch(() => {});
-    };
-    audioEl.onloadedmetadata = tryPlay;
-    audioEl.oncanplay = tryPlay;
-    stream.getAudioTracks().forEach((track) => {
-      track.onunmute = tryPlay;
-    });
-    tryPlay();
-    // A few browsers delay remote audio until the media pipeline becomes
-    // active. Retry briefly without requiring another mic click.
-    [100, 300, 700, 1500].forEach((delay) => setTimeout(tryPlay, delay));
+    const playPromise = audioEl.play();
+    if (playPromise?.catch) {
+      playPromise.catch(() => {
+        // Browser autoplay may require one user gesture. The Voice button
+        // provides that gesture; retry on the next interaction if necessary.
+      });
+    }
   };
 
   const flushPendingCandidates = async (peerId, pc) => {
@@ -1617,25 +1596,25 @@ export default function App() {
   };
 
   const createPeerConnection = (targetPeerId) => {
-    if (!targetPeerId || targetPeerId === myClientId) return null;
-
-    const existing = peerConnectionsRef.current[targetPeerId];
-    if (existing && existing.connectionState !== 'closed') return existing;
+    if (peerConnectionsRef.current[targetPeerId]) {
+      return peerConnectionsRef.current[targetPeerId];
+    }
 
     const pc = new RTCPeerConnection(rtcConfig);
     pendingCandidatesRef.current[targetPeerId] = pendingCandidatesRef.current[targetPeerId] || [];
 
     pc.onicecandidate = (event) => {
-      if (!event.candidate || !channelReadyRef.current) return;
-      channelRef.current?.send({
-        type: 'broadcast',
-        event: 'webrtc-candidate',
-        payload: {
-          from: myClientId,
-          to: targetPeerId,
-          candidate: event.candidate,
-        },
-      });
+      if (event.candidate) {
+        channelRef.current?.send({
+          type: 'broadcast',
+          event: 'webrtc-candidate',
+          payload: {
+            from: myClientId,
+            to: targetPeerId,
+            candidate: event.candidate,
+          },
+        });
+      }
     };
 
     pc.ontrack = (event) => {
@@ -1644,71 +1623,30 @@ export default function App() {
     };
 
     pc.onconnectionstatechange = () => {
-      const connectedPeerExists = Object.entries(peerConnectionsRef.current).some(
-        ([peerId, connection]) =>
-          peerId !== targetPeerId && connection?.connectionState === 'connected'
-      ) || pc.connectionState === 'connected';
+      const states = Object.values(peerConnectionsRef.current).map((peer) => peer.connectionState);
+      const connected = states.some((state) => state === 'connected');
+      setIsVoiceConnected(connected);
 
-      setIsVoiceConnected(connectedPeerExists);
-
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        // Mobile networks/Wi-Fi can briefly disconnect ICE. Do not destroy a
-        // healthy connection immediately; rebuild it only if it stays broken.
-        if (!voiceRecoveryTimersRef.current[targetPeerId]) {
-          const delay = pc.connectionState === 'failed' ? 500 : 2000;
-          voiceRecoveryTimersRef.current[targetPeerId] = setTimeout(() => {
-            delete voiceRecoveryTimersRef.current[targetPeerId];
-
-            if (peerConnectionsRef.current[targetPeerId] !== pc) return;
-            if (pc.connectionState === 'connected' || pc.connectionState === 'connecting') return;
-
-            try { pc.close(); } catch (err) {}
-            delete peerConnectionsRef.current[targetPeerId];
-            delete makingOfferRef.current[targetPeerId];
-            delete pendingCandidatesRef.current[targetPeerId];
-
-            if (remoteAudiosRef.current[targetPeerId]) {
-              remoteAudiosRef.current[targetPeerId].srcObject = null;
-            }
-
-            // Ask the deterministic initiator (smaller client id) to create
-            // a fresh offer. This works even if only the receiver noticed the
-            // network failure.
-            createPeerConnection(targetPeerId);
-            channelRef.current?.send({
-              type: 'broadcast',
-              event: 'webrtc-renegotiate-request',
-              payload: { from: myClientId },
-            });
-            if (myClientId < targetPeerId) {
-              setTimeout(() => negotiateWithPeer(targetPeerId), 150);
-            }
-          }, delay);
-        }
-      }
-
-      if (pc.connectionState === 'closed') {
-        if (voiceRecoveryTimersRef.current[targetPeerId]) {
-          clearTimeout(voiceRecoveryTimersRef.current[targetPeerId]);
-          delete voiceRecoveryTimersRef.current[targetPeerId];
-        }
-        if (peerConnectionsRef.current[targetPeerId] === pc) {
-          delete peerConnectionsRef.current[targetPeerId];
-        }
+      if (['failed', 'closed'].includes(pc.connectionState)) {
+        delete peerConnectionsRef.current[targetPeerId];
+        delete pendingCandidatesRef.current[targetPeerId];
         delete makingOfferRef.current[targetPeerId];
+        const remainingConnected = Object.values(peerConnectionsRef.current)
+          .some((peer) => peer.connectionState === 'connected');
+        setIsVoiceConnected(remainingConnected);
       }
     };
 
-    // One permanent audio m-line per peer. It stays sendrecv even when the
-    // local mic is OFF, so either side can receive audio immediately.
-    let audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
-    pc.__studysyncAudioTransceiver = audioTransceiver;
-
-    const localTrack = localStreamRef.current?.getAudioTracks?.()[0];
-    if (localTrack && audioTransceiver.sender) {
-      audioTransceiver.sender.replaceTrack(localTrack).catch((err) => {
-        console.warn('Initial audio track attach failed:', err);
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => {
+        const alreadyAdded = pc.getSenders().some((sender) => sender.track?.kind === track.kind);
+        if (!alreadyAdded) pc.addTrack(track, localStreamRef.current);
       });
+    } else {
+      // Keep an audio receiving path ready even before this user turns on mic.
+      try {
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+      } catch (err) {}
     }
 
     peerConnectionsRef.current[targetPeerId] = pc;
@@ -1716,13 +1654,7 @@ export default function App() {
   };
 
   const negotiateWithPeer = async (targetPeerId) => {
-    if (!targetPeerId || targetPeerId === myClientId) return;
-    // Smaller client ID is the only offer initiator. This removes offer/offer
-    // collisions when two people join or toggle their microphones together.
-    if (myClientId > targetPeerId) return;
-
     const pc = createPeerConnection(targetPeerId);
-    if (!pc || pc.connectionState === 'closed') return;
     if (makingOfferRef.current[targetPeerId]) return;
     if (pc.signalingState !== 'stable') return;
 
@@ -1730,7 +1662,6 @@ export default function App() {
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      if (!pc.localDescription) return;
 
       channelRef.current?.send({
         type: 'broadcast',
@@ -1749,17 +1680,15 @@ export default function App() {
   };
 
   const handleReceiveOffer = async (fromPeerId, offer) => {
-    if (!fromPeerId || fromPeerId === myClientId || !offer) return;
-    // Larger ID is the answerer only.
-    if (myClientId < fromPeerId) return;
-
     try {
       const pc = createPeerConnection(fromPeerId);
-      if (!pc) return;
 
-      if (pc.signalingState !== 'stable') {
-        return;
-      }
+      // Deterministic negotiation: only the lexicographically smaller client
+      // is allowed to initiate. If the larger client sends an offer anyway,
+      // ignore it instead of creating an offer collision.
+      if (myClientId < fromPeerId) return;
+
+      if (pc.signalingState !== 'stable') return;
 
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       await flushPendingCandidates(fromPeerId, pc);
@@ -1782,34 +1711,25 @@ export default function App() {
   };
 
   const requestVoiceNegotiation = () => {
-    // Tell every peer that the audio sender state may have changed.
     channelRef.current?.send({
       type: 'broadcast',
       event: 'webrtc-renegotiate-request',
       payload: { from: myClientId },
     });
 
-    participants.forEach((peer) => {
-      const peerId = peer?.clientId;
-      if (!peerId || peerId === myClientId) return;
-      if (myClientId < peerId) {
-        negotiateWithPeer(peerId);
-      }
+    Object.keys(peerConnectionsRef.current).forEach((peerId) => {
+      if (myClientId < peerId) negotiateWithPeer(peerId);
     });
   };
 
   const startVoiceChat = async () => {
     if (!canUserVoice) {
-      alert('Microphone permission is disabled. Ask the host.');
-      return;
-    }
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      alert('Microphone is not available in this browser. Use HTTPS or localhost.');
+      alert('Microphone permissions disabled.');
       return;
     }
 
     try {
+      // Reuse an existing stream instead of opening a second microphone.
       if (!localStreamRef.current) {
         localStreamRef.current = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -1822,33 +1742,23 @@ export default function App() {
       }
 
       const stream = localStreamRef.current;
-      const audioTrack = stream.getAudioTracks()[0];
-      if (!audioTrack) throw new Error('No microphone audio track was created.');
-      audioTrack.enabled = true;
 
-      // Attach the SAME microphone track to exactly one sender per peer.
-      for (const peer of participants) {
-        const peerId = peer?.clientId;
-        if (!peerId || peerId === myClientId) continue;
-
-        const pc = createPeerConnection(peerId);
-        if (!pc) continue;
-
-        const transceiver = pc.__studysyncAudioTransceiver || pc.getTransceivers().find(
-          (t) => t.receiver?.track?.kind === 'audio'
-        );
-
-        if (transceiver?.sender) {
-          await transceiver.sender.replaceTrack(audioTrack);
-        }
-      }
+      stream.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+        Object.entries(peerConnectionsRef.current).forEach(([peerId, pc]) => {
+          const audioSender = pc.getSenders().find((sender) => sender.track?.kind === 'audio');
+          if (audioSender) {
+            audioSender.replaceTrack(track);
+          } else {
+            pc.addTrack(track, stream);
+          }
+        });
+      });
 
       setIsMicOn(true);
-      setIsVoiceConnected(
-        Object.values(peerConnectionsRef.current).some((pc) => pc?.connectionState === 'connected')
-      );
+      setIsVoiceConnected(Object.values(peerConnectionsRef.current).some((pc) => pc.connectionState === 'connected'));
 
-      await channelRef.current?.track({
+      channelRef.current?.track({
         clientId: myClientId,
         userName: userName || (isHost ? 'Host' : 'Guest'),
         isHost,
@@ -1857,11 +1767,12 @@ export default function App() {
         permissions: userPermissions,
       });
 
-      // This also handles peers who joined before/after the mic was enabled.
+      // Build one connection per other participant and negotiate from the
+      // deterministic initiator side. Also ask the smaller-ID peer to
+      // renegotiate if the larger-ID peer just enabled its microphone.
       participants.forEach((peer) => {
-        if (peer?.clientId && peer.clientId !== myClientId) {
-          createPeerConnection(peer.clientId);
-        }
+        if (!peer.clientId || peer.clientId === myClientId) return;
+        createPeerConnection(peer.clientId);
       });
       requestVoiceNegotiation();
     } catch (err) {
@@ -1891,8 +1802,7 @@ export default function App() {
     audioTrack.enabled = newEnabled;
     setIsMicOn(newEnabled);
 
-    // Keep presence in sync so every participant sees the correct mic state.
-    await channelRef.current?.track({
+    channelRef.current?.track({
       clientId: myClientId,
       userName: userName || (isHost ? 'Host' : 'Guest'),
       isHost,
@@ -1901,11 +1811,7 @@ export default function App() {
       permissions: userPermissions,
     });
 
-    if (newEnabled) {
-      // Track is already attached to every peer's sender. Renegotiation makes
-      // sure a peer that joined while our mic was off receives it too.
-      requestVoiceNegotiation();
-    }
+    if (newEnabled) requestVoiceNegotiation();
   };
 
   useEffect(() => {
@@ -1914,27 +1820,6 @@ export default function App() {
     }
   }, [textInput.visible]);
 
-  // Mobile Safari/Chrome can delay remote WebRTC audio until a user gesture.
-  // Any normal interaction in the room is used to unlock already-created audio
-  // elements, so every participant can hear the active speaker without having
-  // to toggle their own microphone.
-  useEffect(() => {
-    if (!isSessionActive) return;
-    const unlockRemoteAudio = () => {
-      Object.values(remoteAudiosRef.current).forEach((audioEl) => {
-        if (audioEl?.srcObject) audioEl.play().catch(() => {});
-      });
-    };
-    window.addEventListener('pointerdown', unlockRemoteAudio, { passive: true });
-    window.addEventListener('touchstart', unlockRemoteAudio, { passive: true });
-    window.addEventListener('click', unlockRemoteAudio, { passive: true });
-    return () => {
-      window.removeEventListener('pointerdown', unlockRemoteAudio);
-      window.removeEventListener('touchstart', unlockRemoteAudio);
-      window.removeEventListener('click', unlockRemoteAudio);
-    };
-  }, [isSessionActive]);
-
   const renderImageOnCanvas = (dataUrl) => {
     const img = new Image();
     img.onload = () => {
@@ -1942,61 +1827,12 @@ export default function App() {
       const bgCtx = bgCanvas.getContext('2d');
       bgCtx.fillStyle = '#ffffff';
       bgCtx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-      // Keep the document in a shared world coordinate system. The board's
-      // responsive fit scale then makes the same page proportions appear on
-      // both phone and laptop instead of broadcasting a phone-sized PDF.
-      const targetWidth = Math.min(CANVAS_WIDTH - 160, 3600);
-      const targetHeight = img.width > 0 ? (img.height * targetWidth) / img.width : img.height;
-      const x = (CANVAS_WIDTH - targetWidth) / 2;
-      bgCtx.drawImage(img, x, 80, targetWidth, targetHeight);
+      const x = Math.max(60, (window.innerWidth - img.width) / 2);
+      bgCtx.drawImage(img, x, 40);
       setHasDocument(true);
     };
     img.src = dataUrl;
   };
-
-  // Load the two browser-side engines on demand so PDF upload and the
-  // Extract -> Private Study Notes workflow work even when index.html does not
-  // already include their CDN script tags.
-  const loadExternalScript = (src, globalName) => new Promise((resolve, reject) => {
-    if (window[globalName]) { resolve(window[globalName]); return; }
-    const existing = document.querySelector(`script[data-studysync-src="${src}"]`);
-    if (existing) {
-      existing.addEventListener('load', () => resolve(window[globalName]));
-      existing.addEventListener('error', reject);
-      return;
-    }
-    const script = document.createElement('script');
-    script.src = src;
-    script.async = true;
-    script.dataset.studysyncSrc = src;
-    script.onload = () => window[globalName] ? resolve(window[globalName]) : reject(new Error(`${globalName} did not load`));
-    script.onerror = () => reject(new Error(`Failed to load ${globalName}`));
-    document.head.appendChild(script);
-  });
-
-  const ensurePdfJs = () => loadExternalScript(
-    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
-    'pdfjsLib'
-  );
-
-  const ensureTesseract = () => loadExternalScript(
-    'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js',
-    'Tesseract'
-  );
-
-  const ensureJsPdf = () => loadExternalScript(
-    'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
-    'jspdf'
-  );
-
-  useEffect(() => {
-    if (!isSessionActive) return;
-    // Preload quietly; the actual buttons still show a useful error if a CDN
-    // is blocked/offline.
-    ensurePdfJs().catch(() => {});
-    ensureTesseract().catch(() => {});
-    ensureJsPdf().catch(() => {});
-  }, [isSessionActive]);
 
   const renderPdfSinglePage = async (pdf, targetPage, broadcast = true) => {
     try {
@@ -2035,17 +1871,13 @@ export default function App() {
       const fileReader = new FileReader();
       fileReader.onload = async function () {
         const typedarray = new Uint8Array(this.result);
-        try {
-          const pdfjs = await ensurePdfJs();
-          pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-          const pdf = await pdfjs.getDocument({ data: typedarray }).promise;
+        if (window.pdfjsLib) {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+          const pdf = await window.pdfjsLib.getDocument(typedarray).promise;
           pdfDocRef.current = pdf;
           setNumPages(pdf.numPages);
           setPageNum(1);
-          await renderPdfSinglePage(pdf, 1, true);
-        } catch (err) {
-          console.error('PDF load error:', err);
-          alert('Could not open this PDF. Check your internet connection and try again.');
+          renderPdfSinglePage(pdf, 1, true);
         }
       };
       fileReader.readAsArrayBuffer(file);
@@ -2135,48 +1967,88 @@ export default function App() {
     setTimeout(() => setNotesSaveStatus('Saved'), 2000);
   };
 
-  // Save Private Study Notes directly as a real PDF file.
-  // No print dialog: jsPDF creates the PDF and browser downloads it to the
-  // user's configured Downloads folder automatically.
-  const saveNotesAsPdf = async () => {
-    const notes = (privateNotes || '').trim();
+
+  // Load OCR only when Smart Draw / Extract actually needs it.
+  const tesseractLoaderRef = useRef(null);
+
+  const loadTesseractEngine = async () => {
+    if (window.Tesseract) return window.Tesseract;
+    if (tesseractLoaderRef.current) return tesseractLoaderRef.current;
+
+    tesseractLoaderRef.current = new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[data-studysync-tesseract="true"]');
+      if (existing) {
+        existing.addEventListener('load', () => resolve(window.Tesseract), { once: true });
+        existing.addEventListener('error', reject, { once: true });
+        return;
+      }
+
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+      script.async = true;
+      script.dataset.studysyncTesseract = 'true';
+      script.onload = () => {
+        if (window.Tesseract) resolve(window.Tesseract);
+        else reject(new Error('Tesseract loaded but is unavailable.'));
+      };
+      script.onerror = () => reject(new Error('Unable to load OCR engine.'));
+      document.head.appendChild(script);
+    }).catch((err) => {
+      tesseractLoaderRef.current = null;
+      throw err;
+    });
+
+    return tesseractLoaderRef.current;
+  };
+
+  const downloadPrivateNotesPdf = async () => {
+    const notes = String(privateNotes || '').trim();
     if (!notes) {
-      alert('There are no study notes to save yet.');
+      alert('Your private study notes are empty.');
       return;
     }
 
     try {
-      await ensureJsPdf();
-      const JsPdfCtor = window.jspdf?.jsPDF;
-      if (!JsPdfCtor) throw new Error('PDF engine did not load.');
+      if (!window.jspdf?.jsPDF) {
+        await new Promise((resolve, reject) => {
+          const existing = document.querySelector('script[data-studysync-jspdf="true"]');
+          if (existing) {
+            existing.addEventListener('load', resolve, { once: true });
+            existing.addEventListener('error', reject, { once: true });
+            return;
+          }
+          const script = document.createElement('script');
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
+          script.async = true;
+          script.dataset.studysyncJspdf = 'true';
+          script.onload = resolve;
+          script.onerror = reject;
+          document.head.appendChild(script);
+        });
+      }
 
-      const doc = new JsPdfCtor({
-        orientation: 'portrait',
-        unit: 'mm',
-        format: 'a4',
-      });
+      if (!window.jspdf?.jsPDF) throw new Error('PDF engine unavailable.');
 
-      const margin = 18;
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+      const margin = 42;
       const pageWidth = doc.internal.pageSize.getWidth();
       const pageHeight = doc.internal.pageSize.getHeight();
-      const usableWidth = pageWidth - margin * 2;
-      let y = margin;
+      const maxWidth = pageWidth - margin * 2;
 
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(18);
-      doc.text('Private Study Notes', margin, y);
-      y += 7;
+      doc.text('StudySync - Private Study Notes', margin, margin);
 
       doc.setFont('helvetica', 'normal');
-      doc.setFontSize(9);
-      doc.setTextColor(100, 116, 139);
-      doc.text(`StudySync  •  ${new Date().toLocaleString()}`, margin, y);
-      y += 9;
+      doc.setFontSize(10);
+      doc.setTextColor(100);
+      doc.text(`Room: ${roomId || 'Private Workspace'}`, margin, margin + 18);
+      doc.setTextColor(0);
 
-      doc.setTextColor(15, 23, 42);
-      doc.setFontSize(11);
-      const lines = doc.splitTextToSize(notes, usableWidth);
-      const lineHeight = 5.5;
+      let y = margin + 42;
+      const lines = doc.splitTextToSize(notes.replace(/\t/g, '    '), maxWidth);
+      const lineHeight = 15;
 
       lines.forEach((line) => {
         if (y > pageHeight - margin) {
@@ -2187,12 +2059,96 @@ export default function App() {
         y += lineHeight;
       });
 
-      const safeRoom = String(roomId || 'room').replace(/[^a-z0-9_-]/gi, '_');
-      const date = new Date().toISOString().slice(0, 10);
-      doc.save(`StudySync-Private-Notes-${safeRoom}-${date}.pdf`);
+      doc.save(`StudySync-${roomId || 'Private'}-Study-Notes.pdf`);
     } catch (err) {
-      console.error('Private notes PDF save error:', err);
-      alert('Could not create the PDF. Please try again after the PDF engine loads.');
+      console.error('Private notes PDF download failed:', err);
+      alert('Could not create the PDF. Please try again.');
+    }
+  };
+
+  const downloadPrivateNotesTxt = () => {
+    const notes = String(privateNotes || '');
+    if (!notes.trim()) {
+      alert('Your private study notes are empty.');
+      return;
+    }
+    const blob = new Blob([notes], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `StudySync-${roomId || 'Private'}-Study-Notes.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const recognizeSmartCharacter = async (rawPoints) => {
+    if (!Array.isArray(rawPoints) || rawPoints.length < 5) return null;
+
+    const points = rawPoints
+      .filter((p) => Number.isFinite(p?.x) && Number.isFinite(p?.y))
+      .map((p) => ({ x: Number(p.x), y: Number(p.y) }));
+
+    if (points.length < 5) return null;
+
+    const xs = points.map((p) => p.x);
+    const ys = points.map((p) => p.y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const width = maxX - minX;
+    const height = maxY - minY;
+
+    // OCR is intended for a single handwritten alphabet/number.
+    // Very wide/short strokes are more likely to be lines or arrows.
+    if (width < 10 || height < 14 || width > height * 2.8 || height > width * 5.5) return null;
+
+    try {
+      const Tesseract = await loadTesseractEngine();
+
+      const scale = 4;
+      const pad = 24;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(120, Math.ceil(width * scale + pad * 2));
+      canvas.height = Math.max(120, Math.ceil(height * scale + pad * 2));
+
+      const ctx = canvas.getContext('2d', { willReadFrequently: false });
+      if (!ctx) return null;
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.strokeStyle = '#111111';
+      ctx.lineWidth = Math.max(3, lineWidthRef.current * scale);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo((points[0].x - minX) * scale + pad, (points[0].y - minY) * scale + pad);
+      for (let i = 1; i < points.length; i++) {
+        ctx.lineTo((points[i].x - minX) * scale + pad, (points[i].y - minY) * scale + pad);
+      }
+      ctx.stroke();
+
+      const result = await Tesseract.recognize(canvas, 'eng', {
+        tessedit_pageseg_mode: '10',
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
+        logger: () => {},
+      });
+
+      const detected = String(result?.data?.text || '')
+        .replace(/[^A-Za-z0-9]/g, '')
+        .trim();
+
+      if (!detected || detected.length > 2) return null;
+
+      const char = detected[0];
+      if (!/[A-Za-z0-9]/.test(char)) return null;
+
+      return char;
+    } catch (err) {
+      console.warn('Smart character recognition unavailable:', err);
+      return null;
     }
   };
 
@@ -2205,6 +2161,7 @@ export default function App() {
     if (width < 10 || height < 10) return;
     setIsExtracting(true);
     try {
+      await loadTesseractEngine();
       const bgCanvas = bgCanvasRef.current;
       const cropCanvas = document.createElement('canvas');
       cropCanvas.width = width;
@@ -2212,8 +2169,7 @@ export default function App() {
       const cropCtx = cropCanvas.getContext('2d');
       cropCtx.drawImage(bgCanvas, minX, minY, width, height, 0, 0, width, height);
 
-      const tesseract = await ensureTesseract();
-      const result = await tesseract.recognize(cropCanvas, 'eng');
+      const result = await window.Tesseract.recognize(cropCanvas, 'eng');
       const extractedText = result.data.text.trim();
 
       if (extractedText) {
@@ -2222,8 +2178,6 @@ export default function App() {
         setShowNotesPad(true);
       }
     } catch (err) {
-      console.error('Text extraction error:', err);
-      alert('Text extraction failed. Please make a slightly larger selection and try again.');
     } finally {
       setIsExtracting(false);
     }
@@ -2241,6 +2195,7 @@ export default function App() {
     const fontSize = Math.max(lineWidth * 5, 22);
     const targetY = textInput.y + fontSize * 0.8;
 
+    pushUndoSnapshot();
     elementsRef.current.push({
       id: makeElementId('text'),
       type: 'text',
@@ -2258,21 +2213,15 @@ export default function App() {
     setTextInput({ visible: false, x: 0, y: 0, text: '' });
   };
 
-  // Convert screen coordinates to the actual 4000x2500 canvas coordinate system.
-  // IMPORTANT: use the transformed canvas bounding rect itself. The old code used
-  // the viewport rect, which ignored the viewport's top padding and could produce
-  // a visible ~1 inch drawing offset, especially on mobile / zoomed canvases.
   const getCanvasCoords = (e) => {
     const canvas = drawCanvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
-
     const rect = canvas.getBoundingClientRect();
-    const scaleX = rect.width / canvas.width || zoomScale || 1;
-    const scaleY = rect.height / canvas.height || zoomScale || 1;
-
+    const scaleX = rect.width / CANVAS_WIDTH || zoomScaleRef.current || 1;
+    const scaleY = rect.height / CANVAS_HEIGHT || zoomScaleRef.current || 1;
     return {
-      x: Math.max(0, Math.min(canvas.width, (e.clientX - rect.left) / scaleX)),
-      y: Math.max(0, Math.min(canvas.height, (e.clientY - rect.top) / scaleY)),
+      x: Math.max(0, Math.min(CANVAS_WIDTH, (e.clientX - rect.left) / scaleX)),
+      y: Math.max(0, Math.min(CANVAS_HEIGHT, (e.clientY - rect.top) / scaleY)),
     };
   };
 
@@ -2282,12 +2231,26 @@ export default function App() {
   const canUserVoice = isHost || isCoHost || (userPermissions.canVoice ?? permissions.canVoiceChat);
 
   const handleMouseDown = (e) => {
-    if (e.pointerType === 'touch' && suppressTouchDrawingRef.current) return;
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'TEXTAREA') return;
+    if (e.target?.tagName === 'INPUT' || e.target?.tagName === 'BUTTON' || e.target?.tagName === 'TEXTAREA') return;
+    e.preventDefault?.();
 
     const { x, y } = getCanvasCoords(e);
     setShowShapesMenu(false);
     setShowColorPalette(false);
+
+    // Mobile: never start a drawing while a second touch is active.
+    if (e.pointerId !== undefined) {
+      activePointerIdsRef.current.add(e.pointerId);
+      if (activePointerIdsRef.current.size > 1) {
+        isDrawingRef.current = false;
+        setIsDrawing(false);
+        currentStrokeRef.current = [];
+        setPreviewPoints([]);
+        setPreviewShape(null);
+        return;
+      }
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+    }
 
     if (tool === 'select') {
       let foundEl = null;
@@ -2297,9 +2260,9 @@ export default function App() {
           break;
         }
       }
-
       setSelectedElementId(foundEl ? foundEl.id : null);
       if (foundEl) {
+        pushUndoSnapshot();
         isDraggingElementRef.current = true;
         dragStartPosRef.current = { x, y };
       }
@@ -2311,6 +2274,7 @@ export default function App() {
       const canLaser = isHost || isCoHost || (userPermissions.canSharePointer ?? permissions.canSharePointer);
       if (!canLaser) return;
       setIsDrawing(true);
+      isDrawingRef.current = true;
       addLaserPoint(x, y, true);
       channelRef.current?.send({
         type: 'broadcast',
@@ -2336,20 +2300,19 @@ export default function App() {
       return;
     }
 
-    // Guests without Draw permission may still draw locally. Their drawing is
-    // kept in the local element list so it survives redraws/tool changes, but
-    // it is never broadcast until they are permitted.
+    if (tool === 'extract') {
+      if (!canUserDraw) return;
+    }
+
+    // Guests without Draw permission can still doodle locally, but never share.
     if (!canUserDraw && tool !== 'extract') {
       if (['pencil', 'eraser', 'highlighter', 'smart'].includes(tool)) {
         setIsDrawing(true);
         isDrawingRef.current = true;
         setStartPos({ x, y });
-        const drawCanvas = drawCanvasRef.current;
-        setSnapshot(drawCtxRef.current.getImageData(0, 0, drawCanvas.width, drawCanvas.height));
         strokeStartTimeRef.current = Date.now();
         currentStrokeRef.current = [{ x, y, t: 0 }];
-        drawCtxRef.current.beginPath();
-        drawCtxRef.current.moveTo(x, y);
+        setPreviewPoints([{ x, y }]);
       }
       return;
     }
@@ -2359,17 +2322,20 @@ export default function App() {
     setIsDrawing(true);
     isDrawingRef.current = true;
     setStartPos({ x, y });
+    currentStrokeRef.current = [{ x, y, t: 0 }];
+    setPreviewPoints([{ x, y }]);
+    setPreviewShape(
+      ['rectangle', 'circle', 'line', 'arrow', 'triangle', 'star'].includes(tool)
+        ? { shapeTool: tool, fromX: x, fromY: y, toX: x, toY: y }
+        : tool === 'extract'
+          ? { shapeTool: 'extract', fromX: x, fromY: y, toX: x, toY: y }
+          : null
+    );
+    strokeStartTimeRef.current = Date.now();
 
-    const drawCanvas = drawCanvasRef.current;
-    setSnapshot(drawCtxRef.current.getImageData(0, 0, drawCanvas.width, drawCanvas.height));
-
-    if (['pencil', 'eraser', 'highlighter', 'smart'].includes(tool)) {
-      strokeStartTimeRef.current = Date.now();
-      currentStrokeRef.current = [{ x, y, t: 0 }];
-      drawCtxRef.current.beginPath();
-      drawCtxRef.current.moveTo(x, y);
-    }
+    // Do not snapshot the 40-million-pixel canvas. Preview is vector based.
   };
+
 
   const drawShapeDirect = (ctx, shapeTool, fromX, fromY, toX, toY) => {
     ctx.beginPath();
@@ -2394,8 +2360,11 @@ export default function App() {
     } else if (shapeTool === 'rectangle') {
       ctx.strokeRect(fromX, fromY, toX - fromX, toY - fromY);
     } else if (shapeTool === 'circle') {
-      const radius = Math.hypot(toX - fromX, toY - fromY);
-      ctx.arc(fromX, fromY, radius, 0, 2 * Math.PI);
+      const cx = (fromX + toX) / 2;
+      const cy = (fromY + toY) / 2;
+      const rx = Math.abs(toX - fromX) / 2;
+      const ry = Math.abs(toY - fromY) / 2;
+      ctx.ellipse(cx, cy, Math.max(rx, 1), Math.max(ry, 1), 0, 0, 2 * Math.PI);
       ctx.stroke();
     } else if (shapeTool === 'triangle') {
       ctx.moveTo(fromX + (toX - fromX) / 2, fromY);
@@ -2428,7 +2397,7 @@ export default function App() {
   };
 
   const handleMouseMove = (e) => {
-    if (e.pointerType === 'touch' && suppressTouchDrawingRef.current) return;
+    e.preventDefault?.();
     const { x, y } = getCanvasCoords(e);
 
     if (tool === 'select') {
@@ -2447,7 +2416,7 @@ export default function App() {
       return;
     }
 
-    if (tool === 'laser' && isDrawing) {
+    if (tool === 'laser' && isDrawingRef.current) {
       addLaserPoint(x, y);
       channelRef.current?.send({
         type: 'broadcast',
@@ -2462,55 +2431,66 @@ export default function App() {
       channelRef.current?.send({
         type: 'broadcast',
         event: 'cursor-move',
-        payload: { clientId: myClientId, x, y, visible: true, name: userName || (isHost ? 'Host' : 'Guest'), isHost: isHost || isCoHost },
+        payload: {
+          clientId: myClientId, x, y, visible: true,
+          name: userName || (isHost ? 'Host' : 'Guest'),
+          isHost: isHost || isCoHost
+        },
       });
     }
 
-    if (!isDrawing) return;
+    if (!isDrawingRef.current) return;
 
-    const ctx = drawCtxRef.current;
-    const isLocalOnlyStroke = !canUserDraw && ['pencil', 'eraser', 'highlighter', 'smart'].includes(tool);
+    // If a second touch appears, stop drawing immediately.
+    if (activePointerIdsRef.current.size > 1) {
+      currentStrokeRef.current = [];
+      setPreviewPoints([]);
+      setPreviewShape(null);
+      isDrawingRef.current = false;
+      setIsDrawing(false);
+      return;
+    }
 
-    if (['pencil', 'eraser', 'highlighter'].includes(tool)) {
-      ctx.lineTo(x, y);
-      ctx.stroke();
-      currentStrokeRef.current.push({ x, y });
-    } else if (tool === 'smart') {
-      ctx.lineTo(x, y);
-      ctx.stroke();
+    if (['pencil', 'highlighter', 'smart'].includes(tool)) {
       const t = Date.now() - strokeStartTimeRef.current;
       currentStrokeRef.current.push({ x, y, t });
-    } else if (tool === 'extract' && snapshot) {
-      ctx.putImageData(snapshot, 0, 0);
+      setPreviewPoints((prev) => {
+        const next = prev.length > 500 ? prev.slice(-400) : prev;
+        return [...next, { x, y }];
+      });
+      return;
+    }
+
+    if (tool === 'eraser') {
+      const ctx = drawCtxRef.current;
+      if (!ctx) return;
       ctx.save();
-      ctx.setLineDash([5, 5]);
-      ctx.strokeStyle = '#2563eb';
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(startPos.x, startPos.y, x - startPos.x, y - startPos.y);
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = lineWidthRef.current * 6;
+      ctx.lineCap = 'round';
+      const pts = currentStrokeRef.current;
+      const last = pts[pts.length - 1];
+      if (last) {
+        ctx.beginPath();
+        ctx.moveTo(last.x, last.y);
+        ctx.lineTo(x, y);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(x, y, Math.max(2, lineWidthRef.current * 3), 0, Math.PI * 2);
+        ctx.fill();
+      }
       ctx.restore();
-    } else if (snapshot) {
-      ctx.putImageData(snapshot, 0, 0);
-      drawShapeDirect(ctx, tool, startPos.x, startPos.y, x, y);
+      currentStrokeRef.current.push({ x, y });
+      return;
+    }
+
+    if (tool === 'extract' || ['rectangle', 'circle', 'line', 'arrow', 'triangle', 'star'].includes(tool)) {
+      setPreviewShape({ shapeTool: tool, fromX: startPos.x, fromY: startPos.y, toX: x, toY: y });
     }
   };
 
-  useEffect(() => {
-    if (!isSessionActive) return;
-
-    // Pointer events work for mouse, touch and stylus. Keeping a window-level
-    // release prevents a stroke from getting stuck when the finger/mouse leaves
-    // the canvas before release.
-    const releasePointer = (event) => {
-      if (isDrawingRef.current) handleMouseUp(event);
-    };
-
-    window.addEventListener('pointerup', releasePointer);
-    window.addEventListener('pointercancel', releasePointer);
-    return () => {
-      window.removeEventListener('pointerup', releasePointer);
-      window.removeEventListener('pointercancel', releasePointer);
-    };
-  }, [isSessionActive, tool]);
 
   const handleMouseLeave = (e) => {
     const canSendPointer = isHost || isCoHost || (userPermissions.canSharePointer ?? permissions.canSharePointer);
@@ -2521,17 +2501,25 @@ export default function App() {
         payload: { clientId: myClientId, x: -100, y: -100, visible: false, name: '' },
       });
     }
-    // Pointer capture keeps touch/stylus drawing alive even when the finger
-    // crosses the canvas boundary. Do not finish a touch stroke on pointerleave.
-    if (e?.pointerType !== 'touch' && !e?.pointerType) handleMouseUp(e);
+    // Pointer capture keeps an active touch/mouse stroke alive outside the canvas.
+    if (e?.pointerId !== undefined && activePointerIdsRef.current.has(e.pointerId)) return;
   };
 
-  const handleMouseUp = (e) => {
+  const handleMouseUp = async (e) => {
+    if (e?.pointerId !== undefined) {
+      activePointerIdsRef.current.delete(e.pointerId);
+      try { e.currentTarget?.releasePointerCapture?.(e.pointerId); } catch (_) {}
+    }
+
     if (tool === 'select') {
       if (isDraggingElementRef.current) {
         isDraggingElementRef.current = false;
         const moved = elementsRef.current.find((el) => el.id === selectedElementId);
-        if (moved) broadcastUpdatedElement(moved);
+        if (moved) {
+          moved.updatedAt = Date.now();
+          broadcastUpdatedElement(moved);
+          redrawCanvas();
+        }
       }
       return;
     }
@@ -2542,73 +2530,129 @@ export default function App() {
       return;
     }
 
-    if (!isDrawing) return;
+    if (!isDrawingRef.current) {
+      setPreviewPoints([]);
+      setPreviewShape(null);
+      return;
+    }
+
+    const { x, y } = e ? getCanvasCoords(e) : startPos;
     setIsDrawing(false);
     isDrawingRef.current = false;
 
     const isLocalOnlyStroke = !canUserDraw && ['pencil', 'eraser', 'highlighter', 'smart'].includes(tool);
-    const { x, y } = e ? getCanvasCoords(e) : startPos;
 
     if (tool === 'extract') {
-      if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
+      setPreviewShape(null);
       extractTextFromRegion(startPos.x, startPos.y, x, y);
       return;
     }
 
-    if (tool === 'smart') {
-      drawCtxRef.current.closePath();
+    if (isLocalOnlyStroke) {
+      currentStrokeRef.current = [];
+      setPreviewPoints([]);
+      setPreviewShape(null);
+      redrawCanvas();
+      return;
+    }
+
+    if (['pencil', 'highlighter', 'smart'].includes(tool)) {
       const strokePoints = [...currentStrokeRef.current];
       currentStrokeRef.current = [];
+      setPreviewPoints([]);
+      setPreviewShape(null);
 
-      // Unpermitted guests still get the full Auto-correct experience on
-      // their own board. The resulting element is simply not broadcast.
-      if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
-      const corrected = recognizeAndDrawSmartShape(strokePoints, !isLocalOnlyStroke);
+      if (strokePoints.length < 2) {
+        redrawCanvas();
+        return;
+      }
 
-      // If the stroke is not confidently recognizable as a shape, Smart Pen
-      // must behave like a normal pen instead of silently deleting the stroke.
-      if (!corrected && strokePoints.length > 1) {
-        const now = Date.now();
-        const fallback = {
-          id: makeElementId('smart-stroke'),
+      pushUndoSnapshot();
+
+      if (tool === 'smart') {
+        const corrected = recognizeAndDrawSmartShape(strokePoints);
+        if (!corrected) {
+          const detectedCharacter = await recognizeSmartCharacter(strokePoints);
+          if (detectedCharacter) {
+            const now = Date.now();
+            const charElement = {
+              id: makeElementId('smart-character'),
+              type: 'text',
+              text: detectedCharacter,
+              x: Math.min(...strokePoints.map((p) => p.x)),
+              y: Math.max(...strokePoints.map((p) => p.y)),
+              color: colorRef.current,
+              fontSize: Math.max(lineWidthRef.current * 7, 34),
+              createdAt: now,
+              updatedAt: now,
+              source: 'smart-ocr',
+            };
+            elementsRef.current.push(charElement);
+            redrawCanvas();
+            broadcastElement(charElement);
+          } else {
+            const now = Date.now();
+            const fallback = {
+              id: makeElementId('smart-stroke'),
+              type: 'stroke',
+              points: strokePoints,
+              color: colorRef.current,
+              width: lineWidthRef.current,
+              createdAt: now,
+              updatedAt: now,
+            };
+            elementsRef.current.push(fallback);
+            redrawCanvas();
+            broadcastElement(fallback);
+          }
+        }
+      } else {
+        const newElement = {
+          id: makeElementId('stroke'),
           type: 'stroke',
           points: strokePoints,
           color: colorRef.current,
           width: lineWidthRef.current,
-          createdAt: now,
-          updatedAt: now,
+          isHighlighter: tool === 'highlighter',
+          isEraser: false,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
         };
-        elementsRef.current.push(fallback);
+        elementsRef.current.push(newElement);
         redrawCanvas();
-        if (!isLocalOnlyStroke) broadcastElement(fallback);
+        broadcastElement(newElement);
       }
       return;
     }
 
-    if (['pencil', 'eraser', 'highlighter'].includes(tool)) {
-      drawCtxRef.current.closePath();
-
-      // Permission controls sharing, not whether the guest can draw on
-      // their own canvas. Store local-only strokes in the same canonical
-      // element list so they survive tool changes and redraws.
+    if (tool === 'eraser') {
+      const erasePoints = [...currentStrokeRef.current];
+      currentStrokeRef.current = [];
+      setPreviewShape(null);
+      if (erasePoints.length < 2) {
+        redrawCanvas();
+        return;
+      }
+      pushUndoSnapshot();
       const newElement = {
-        id: makeElementId('stroke'),
+        id: makeElementId('eraser'),
         type: 'stroke',
-        points: [...currentStrokeRef.current],
-        color,
-        width: lineWidth,
-        isHighlighter: tool === 'highlighter',
-        isEraser: tool === 'eraser',
-        localOnly: isLocalOnlyStroke,
+        points: erasePoints,
+        color: '#000000',
+        width: lineWidthRef.current,
+        isHighlighter: false,
+        isEraser: true,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
       elementsRef.current.push(newElement);
-      currentStrokeRef.current = [];
       redrawCanvas();
-      if (!isLocalOnlyStroke) broadcastElement(newElement);
-    } else {
-      if (snapshot) drawCtxRef.current.putImageData(snapshot, 0, 0);
+      broadcastElement(newElement);
+      return;
+    }
+
+    if (['rectangle', 'circle', 'line', 'arrow', 'triangle', 'star'].includes(tool)) {
+      pushUndoSnapshot();
       const newElement = {
         id: makeElementId('shape'),
         type: 'shape',
@@ -2617,25 +2661,31 @@ export default function App() {
         fromY: startPos.y,
         toX: x,
         toY: y,
-        color,
-        width: lineWidth,
+        color: colorRef.current,
+        width: lineWidthRef.current,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
       elementsRef.current.push(newElement);
+      setPreviewShape(null);
       redrawCanvas();
       broadcastElement(newElement);
     }
   };
 
-  const clearCanvas = () => {
-    if (!canUserDraw) return;
-    elementsRef.current = [];
-    redrawCanvas();
-    setTextInput({ visible: false, x: 0, y: 0, text: '' });
 
-    safeBroadcast('board-clear', { clearedAt: Date.now() });
-    safeBroadcast('clear-board', { clearedAt: Date.now() });
+  const clearCanvas = () => {
+    if (!canUserDraw || elementsRef.current.length === 0) return;
+    pushUndoSnapshot();
+    elementsRef.current = [];
+    currentStrokeRef.current = [];
+    setPreviewPoints([]);
+    setPreviewShape(null);
+    setSelectedElementId(null);
+    setTextInput({ visible: false, x: 0, y: 0, text: '' });
+    redrawCanvas();
+    // One authoritative event only.
+    broadcastBoardReplace([]);
   };
 
   const copyInviteLink = () => {
@@ -2644,6 +2694,26 @@ export default function App() {
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2200);
   };
+
+  useEffect(() => {
+    if (!isSessionActive) return;
+    const onKeyDown = (e) => {
+      const target = e.target;
+      const editing = target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable;
+      if (editing) return;
+      const mod = e.ctrlKey || e.metaKey;
+      if (!mod) return;
+      if (e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undoBoard();
+      } else if ((e.key.toLowerCase() === 'z' && e.shiftKey) || e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        redoBoard();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isSessionActive, canUserDraw]);
 
   const changeTool = (nextTool) => {
     if (isDrawingRef.current) {
@@ -2669,136 +2739,14 @@ export default function App() {
   const isOnlyOneInRoom = participants.length <= 1;
 
   return (
-    <div className="relative w-screen h-[100dvh] overflow-hidden select-none font-['Inter',sans-serif] bg-slate-100 text-slate-800 studysync-app" style={{ touchAction: 'none' }}>
-      <style>{`
-        .studysync-app, .studysync-app * { -webkit-tap-highlight-color: transparent; }\n        html, body, #root { max-width: 100%; overflow-x: hidden; }
-        .studysync-header { overflow-x: auto; scrollbar-width: none; touch-action: pan-x; overscroll-behavior-x: contain; }
-        .studysync-header::-webkit-scrollbar, .studysync-dock::-webkit-scrollbar { display: none; }
-        .studysync-header > div { flex-shrink: 0; }
-        .studysync-dock { max-width: calc(100vw - 24px); overflow: visible; scrollbar-width: none; }
-        .studysync-dock > div { flex-shrink: 0; }
-        .studysync-panel { overscroll-behavior: contain; }
-        @media (max-width: 768px) {
-          .studysync-header { height: 56px; padding-left: max(8px, env(safe-area-inset-left)); padding-right: max(8px, env(safe-area-inset-right)); justify-content: flex-start; gap: 10px; }
-          .studysync-header > div { gap: 6px; }
-          .studysync-header button, .studysync-dock button { min-height: 42px; touch-action: manipulation; }
-          .studysync-header .font-mono { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-          /* The drawing area must start below the real mobile header, not underneath it. */
-          .studysync-app > .studysync-header ~ .absolute.inset-0 {
-            top: 56px !important;
-            bottom: 0 !important;
-            height: auto !important;
-            padding-top: 0 !important;
-            width: 100vw !important;
-            touch-action: none !important;
-          }
-
-          /* Keep the bottom toolbar inside the safe area and make it horizontally scrollable. */
-          .studysync-dock {
-            left: 8px;
-            right: 8px;
-            bottom: max(8px, env(safe-area-inset-bottom));
-            transform: none;
-            width: auto;
-            max-width: none;
-            height: 58px;
-            padding: 7px 9px;
-            border-radius: 17px;
-            gap: 8px;
-            justify-content: flex-start;
-            align-items: center;
-            flex-wrap: nowrap;
-            overflow-x: auto;
-            overflow-y: hidden;
-            overscroll-behavior-x: contain;
-            overscroll-behavior-y: none;
-            -webkit-overflow-scrolling: touch;
-            touch-action: pan-x;
-            scroll-snap-type: x proximity;
-          }
-          .studysync-dock > div { flex: 0 0 auto; flex-shrink: 0; }
-          .studysync-dock > .h-6 { display: block; flex: 0 0 1px; }
-          .studysync-dock > div:first-child {
-            display: flex;
-            align-items: center;
-            flex: 0 0 auto;
-          }
-          .studysync-dock > div:first-child span { min-width: 44px; text-align: center; }
-          .studysync-dock button { flex: 0 0 auto; }
-          .studysync-dock::before, .studysync-dock::after { content: ''; flex: 0 0 2px; }
-          .studysync-dock { scrollbar-width: none; }
-          .studysync-dock::-webkit-scrollbar { display: none; }
-
-          /* Every popup fits the phone width and remains independently scrollable. */
-          .studysync-panel {
-            left: 10px !important;
-            right: 10px !important;
-            width: auto !important;
-            max-width: none !important;
-            top: 64px !important;
-            max-height: calc(100dvh - 124px) !important;
-            overflow: hidden;
-            overscroll-behavior: contain;
-            touch-action: auto;
-          }
-          .studysync-panel .overflow-y-auto {
-            overscroll-behavior: contain;
-            -webkit-overflow-scrolling: touch;
-            touch-action: pan-y;
-          }
-          .studysync-slides-panel { max-height: calc(100dvh - 124px) !important; }
-          .studysync-chat-panel { height: min(480px, calc(100dvh - 124px)) !important; }
-          .studysync-notes-panel { max-height: calc(100dvh - 124px) !important; }
-          .studysync-notes-panel textarea { height: min(42vh, 300px) !important; touch-action: auto; }
-
-          /* Avoid browser text selection/dragging while drawing, but allow inputs to work normally. */
-          input, textarea, button, select { -webkit-user-select: auto; }
-          canvas { -webkit-user-select: none; user-select: none; }
-        }
-        /* Mobile board: pinch/zoom belongs to the browser/app viewport, while
-           the tool dock keeps its own horizontal gesture area. */
-        .studysync-board-wrap {
-          touch-action: none;
-          overscroll-behavior: none;
-          -webkit-user-select: none;
-          user-select: none;
-        }
-        .studysync-board-wrap canvas {
-          touch-action: none;
-          -webkit-user-select: none;
-          user-select: none;
-        }
-        @media (max-width: 768px) {
-          .studysync-board-wrap {
-            width: 100%;
-            height: 100%;
-            overflow: hidden;
-          }
-          .studysync-dock {
-            z-index: 60;
-          }
-        }
-        @media (max-width: 420px) {
-          .studysync-header .studysync-brand-name { display: none; }
-          .studysync-header { gap: 7px; }
-          .studysync-dock { max-width: none; }
-          .studysync-panel { left: 8px !important; right: 8px !important; }
-        }
-        @media (orientation: landscape) and (max-width: 900px) {
-          .studysync-header { height: 50px; }
-          .studysync-app > .studysync-header ~ .absolute.inset-0 { top: 50px !important; }
-          .studysync-panel { top: 58px !important; max-height: calc(100dvh - 108px) !important; }
-        }
-      `}</style>
-
+    <div className="relative w-screen h-screen overflow-hidden select-none font-['Inter',sans-serif] bg-slate-100 text-slate-800">
       {/* FIXED TOP HEADER */}
-      <header className="fixed top-0 left-0 right-0 h-14 bg-white/95 backdrop-blur-md border-b border-slate-200 px-5 flex items-center justify-between z-40 shadow-sm studysync-header">
+      <header className="studysync-header fixed top-0 left-0 right-0 h-14 bg-white/95 backdrop-blur-md border-b border-slate-200 px-5 flex items-center justify-between z-40 shadow-sm">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white font-black text-sm shadow-sm">
             S
           </div>
-          <span className="font-bold text-sm tracking-tight text-slate-900 studysync-brand-name">StudySync</span>
+          <span className="font-bold text-sm tracking-tight text-slate-900">StudySync</span>
           <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isHost ? 'bg-blue-100 text-blue-700' : isCoHost ? 'bg-purple-100 text-purple-700' : 'bg-slate-100 text-slate-600'}`}>
             {isHost ? 'Host' : isCoHost ? 'Co-Host' : 'Guest'}
           </span>
@@ -2882,12 +2830,19 @@ export default function App() {
       </header>
 
       {/* FIXED BOTTOM WORKSPACE DOCK */}
-      <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-white/95 backdrop-blur-xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] border border-slate-200/90 rounded-2xl px-4 py-2 flex items-center gap-3 z-40 studysync-dock">
+      <div className="studysync-dock fixed bottom-6 left-1/2 -translate-x-1/2 bg-white/95 backdrop-blur-xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] border border-slate-200/90 rounded-2xl px-4 py-2 flex items-center gap-3 z-40">
         <div className="flex items-center gap-1 bg-slate-100 px-2 py-1 rounded-xl text-xs font-mono">
           <button onClick={() => handleZoom(-0.1)} className="hover:text-blue-600 font-bold px-1">−</button>
           <span>{Math.round(zoomScale * 100)}%</span>
           <button onClick={() => handleZoom(0.1)} className="hover:text-blue-600 font-bold px-1">+</button>
           <button onClick={handleResetZoom} title="Reset zoom and position" className="ml-1 px-2 py-1 rounded-lg bg-white hover:bg-blue-50 text-[10px] font-bold text-slate-600 border border-slate-200">Reset</button>
+        </div>
+
+        <div className="h-6 w-[1px] bg-slate-200" />
+
+        <div className="flex items-center gap-1">
+          <button onClick={undoBoard} disabled={!canUserDraw || undoStackRef.current.length === 0} title="Undo (Ctrl/Cmd + Z)" className="w-8 h-8 rounded-xl flex items-center justify-center text-base font-bold transition disabled:opacity-30 disabled:cursor-not-allowed hover:bg-slate-100">↶</button>
+          <button onClick={redoBoard} disabled={!canUserDraw || redoStackRef.current.length === 0} title="Redo (Ctrl/Cmd + Shift + Z)" className="w-8 h-8 rounded-xl flex items-center justify-center text-base font-bold transition disabled:opacity-30 disabled:cursor-not-allowed hover:bg-slate-100">↷</button>
         </div>
 
         <div className="h-6 w-[1px] bg-slate-200" />
@@ -2981,7 +2936,7 @@ export default function App() {
 
       {/* SLIDES DRAWER */}
       {showSlidesDrawer && (
-        <div className="fixed top-16 left-6 w-80 max-h-[75vh] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col studysync-panel studysync-slides-panel">
+        <div className="fixed top-16 left-6 w-80 max-h-[75vh] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-3">
             <span className="font-bold text-xs">📑 Snapped Slides ({savedSlides.length})</span>
             <button onClick={() => setShowSlidesDrawer(false)} className="text-xs text-slate-400 font-bold">✕</button>
@@ -3009,7 +2964,7 @@ export default function App() {
 
       {/* CHAT DRAWER */}
       {showChatPad && (
-        <div className="fixed top-16 right-6 w-80 h-[480px] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col studysync-panel studysync-chat-panel">
+        <div className="fixed top-16 right-6 w-80 h-[480px] bg-white/95 backdrop-blur-md shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-2">
             <span className="font-bold text-xs">💬 In-Room Chat</span>
             <button onClick={() => setShowChatPad(false)} className="text-xs text-slate-400 font-bold">✕</button>
@@ -3035,24 +2990,33 @@ export default function App() {
 
       {/* PRIVATE NOTES PANEL */}
       {showNotesPad && (
-        <div className="fixed top-16 right-6 w-84 bg-white/95 backdrop-blur shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col studysync-panel studysync-notes-panel">
+        <div className="studysync-notes-panel fixed top-16 right-6 w-84 bg-white/95 backdrop-blur shadow-2xl border border-slate-200 rounded-2xl p-4 z-40 flex flex-col">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-2">
             <span className="font-bold text-xs">📝 Private Study Notes</span>
-            <div className="flex items-center gap-1.5">
-              <span className="text-[10px] text-emerald-600 font-medium mr-1">● {notesSaveStatus}</span>
-              <button
-                type="button"
-                onClick={saveNotesAsPdf}
-                disabled={!privateNotes.trim()}
-                title="Save notes as PDF"
-                className="px-2 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-[10px] font-semibold text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
-              >
-                📄 PDF
-              </button>
-              <button onClick={() => setShowNotesPad(false)} className="text-xs text-slate-400 font-bold ml-0.5">✕</button>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-emerald-600 font-medium">● {notesSaveStatus}</span>
+              <button onClick={() => setShowNotesPad(false)} className="text-xs text-slate-400 font-bold">✕</button>
             </div>
           </div>
           <textarea value={privateNotes} onChange={(e) => savePrivateNotes(e.target.value)} onKeyDown={(e) => e.stopPropagation()} placeholder="Type personal notes..." className="w-full h-72 bg-slate-50/80 p-3 rounded-xl resize-none border border-slate-200 outline-none text-xs leading-relaxed font-mono select-text" />
+          <div className="mt-3 pt-3 border-t border-slate-100 flex gap-2">
+            <button
+              type="button"
+              onClick={downloadPrivateNotesPdf}
+              disabled={!privateNotes.trim()}
+              className="flex-1 px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-[11px] font-bold shadow-sm transition"
+            >
+              ↓ Download PDF
+            </button>
+            <button
+              type="button"
+              onClick={downloadPrivateNotesTxt}
+              disabled={!privateNotes.trim()}
+              className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed text-slate-700 text-[11px] font-bold border border-slate-200 transition"
+            >
+              TXT
+            </button>
+          </div>
         </div>
       )}
 
@@ -3185,8 +3149,8 @@ export default function App() {
         <div
           className="fixed z-[60]"
           style={{
-            left: `${textInput.x * boardFitScale * zoomScale + panOffset.x}px`,
-            top: `${textInput.y * boardFitScale * zoomScale + panOffset.y + 56}px`,
+            left: `${textInput.x * zoomScale + panOffset.x}px`,
+            top: `${textInput.y * zoomScale + panOffset.y + 56}px`,
           }}
         >
           <textarea
@@ -3213,132 +3177,102 @@ export default function App() {
       )}
 
       {/* INFINITE EXPANDING CANVAS VIEWPORT */}
-      <div ref={viewportRef} className="absolute inset-0 w-screen h-[100dvh] overflow-hidden pt-14 cursor-crosshair z-0 studysync-board-wrap" style={{ touchAction: 'none' }}>
-        <div style={{ transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${boardFitScale * zoomScale})`, transformOrigin: 'top left', width: `${CANVAS_WIDTH}px`, height: `${CANVAS_HEIGHT}px` }} className="relative top-0 left-0">
+      <div ref={viewportRef} className="absolute inset-0 w-screen h-screen overflow-hidden pt-14 cursor-crosshair z-0" style={{ touchAction: tool === 'select' ? 'none' : 'none' }}>
+        <div style={{ transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`, transformOrigin: 'top left', width: `${CANVAS_WIDTH}px`, height: `${CANVAS_HEIGHT}px` }} className="relative top-0 left-0">
           <canvas ref={bgCanvasRef} className="absolute top-0 left-0 pointer-events-none z-0 shadow-sm" />
           <canvas
             ref={drawCanvasRef}
-            onPointerDown={(e) => {
-              e.preventDefault();
-
-              if (e.pointerType === 'touch') {
-                activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-
-                if (activeTouchPointersRef.current.size >= 2) {
-                  // A second finger always switches from drawing to navigation.
-                  suppressTouchDrawingRef.current = true;
-                  if (isDrawingRef.current || isDraggingElementRef.current) {
-                    isDrawingRef.current = false;
-                    isDraggingElementRef.current = false;
-                    setIsDrawing(false);
-                    redrawCanvas();
-                  }
-
-                  const pts = Array.from(activeTouchPointersRef.current.values()).slice(0, 2);
-                  const dx = pts[1].x - pts[0].x;
-                  const dy = pts[1].y - pts[0].y;
-                  const distance = Math.max(1, Math.hypot(dx, dy));
-                  const center = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
-                  const canvas = drawCanvasRef.current;
-                  const rect = canvas?.getBoundingClientRect();
-                  const currentRenderScale = Math.max(0.0001, boardFitScaleRef.current * zoomScaleRef.current);
-                  const currentPan = panOffsetRef.current;
-                  const originX = rect ? rect.left - currentPan.x : 0;
-                  const originY = rect ? rect.top - currentPan.y : 0;
-                  const focalWorld = {
-                    x: rect ? (center.x - rect.left) / currentRenderScale : 0,
-                    y: rect ? (center.y - rect.top) / currentRenderScale : 0,
-                  };
-
-                  pinchGestureRef.current = {
-                    startDistance: distance,
-                    startScale: currentScale,
-                    startOrigin: { x: originX, y: originY },
-                    focalWorld,
-                  };
-                  e.currentTarget.setPointerCapture?.(e.pointerId);
-                  return;
-                }
-
-                if (suppressTouchDrawingRef.current) return;
-              }
-
-              e.currentTarget.setPointerCapture?.(e.pointerId);
-              handleMouseDown(e);
-            }}
-            onPointerMove={(e) => {
-              e.preventDefault();
-
-              if (e.pointerType === 'touch') {
-                const active = activeTouchPointersRef.current;
-                if (active.has(e.pointerId)) active.set(e.pointerId, { x: e.clientX, y: e.clientY });
-
-                if (pinchGestureRef.current && active.size >= 2) {
-                  const pts = Array.from(active.values()).slice(0, 2);
-                  const dx = pts[1].x - pts[0].x;
-                  const dy = pts[1].y - pts[0].y;
-                  const distance = Math.max(1, Math.hypot(dx, dy));
-                  const center = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
-                  const gesture = pinchGestureRef.current;
-                  const nextScale = Math.max(0.5, Math.min(2.5, Number((gesture.startScale * (distance / gesture.startDistance)).toFixed(2))));
-                  const nextRenderScale = Math.max(0.0001, boardFitScaleRef.current * nextScale);
-                  // Keep the two-finger focal point locked while scaling.
-                  const nextPan = {
-                    x: center.x - gesture.startOrigin.x - gesture.focalWorld.x * nextRenderScale,
-                    y: center.y - gesture.startOrigin.y - gesture.focalWorld.y * nextRenderScale,
-                  };
-                  zoomScaleRef.current = nextScale;
-                  panOffsetRef.current = nextPan;
-                  setZoomScale(nextScale);
-                  setPanOffset(nextPan);
-                  return;
-                }
-
-                if (suppressTouchDrawingRef.current) return;
-              }
-
-              handleMouseMove(e);
-            }}
-            onPointerUp={(e) => {
-              e.preventDefault();
-              if (e.pointerType === 'touch') {
-                activeTouchPointersRef.current.delete(e.pointerId);
-                e.currentTarget.releasePointerCapture?.(e.pointerId);
-                if (activeTouchPointersRef.current.size < 2) pinchGestureRef.current = null;
-                if (activeTouchPointersRef.current.size === 0) suppressTouchDrawingRef.current = false;
-                // Never turn a two-finger navigation gesture into a stroke on release.
-                if (suppressTouchDrawingRef.current) return;
-              }
-              e.currentTarget.releasePointerCapture?.(e.pointerId);
-              handleMouseUp(e);
-            }}
-            onPointerCancel={(e) => {
-              e.preventDefault();
-              if (e.pointerType === 'touch') {
-                activeTouchPointersRef.current.delete(e.pointerId);
-                pinchGestureRef.current = null;
-                e.currentTarget.releasePointerCapture?.(e.pointerId);
-                if (activeTouchPointersRef.current.size === 0) suppressTouchDrawingRef.current = false;
-                isDrawingRef.current = false;
-                setIsDrawing(false);
-                redrawCanvas();
-                return;
-              }
-              e.currentTarget.releasePointerCapture?.(e.pointerId);
-              handleMouseUp(e);
-            }}
+            onPointerDown={handleMouseDown}
+            onPointerMove={handleMouseMove}
+            onPointerUp={handleMouseUp}
+            onPointerCancel={handleMouseUp}
             onPointerLeave={handleMouseLeave}
             style={{ touchAction: 'none', WebkitUserSelect: 'none', userSelect: 'none' }}
-            className="absolute top-0 left-0 z-10 touch-none"
+            className="absolute top-0 left-0 z-10"
           />
           <canvas ref={laserCanvasRef} className="absolute top-0 left-0 pointer-events-none z-20" />
+
+          {/* Lightweight vector preview: does not redraw the 4000x10000 bitmap while dragging. */}
+          {(previewPoints.length > 1 || previewShape) && (
+            <svg
+              width={CANVAS_WIDTH}
+              height={CANVAS_HEIGHT}
+              viewBox={`0 0 ${CANVAS_WIDTH} ${CANVAS_HEIGHT}`}
+              className="absolute top-0 left-0 z-[25] pointer-events-none"
+              style={{ overflow: 'visible' }}
+            >
+              {previewPoints.length > 1 && (
+                <polyline
+                  points={previewPoints.map((p) => `${p.x},${p.y}`).join(' ')}
+                  fill="none"
+                  stroke={tool === 'highlighter' ? (color === '#0f172a' ? '#facc15' : color) : color}
+                  strokeWidth={tool === 'highlighter' ? lineWidth * 5 : lineWidth}
+                  strokeOpacity={tool === 'highlighter' ? 0.35 : 1}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              )}
+              {previewShape?.shapeTool === 'line' && (
+                <line x1={previewShape.fromX} y1={previewShape.fromY} x2={previewShape.toX} y2={previewShape.toY}
+                  stroke={color} strokeWidth={lineWidth} strokeLinecap="round" />
+              )}
+              {previewShape?.shapeTool === 'arrow' && (
+                <>
+                  <line x1={previewShape.fromX} y1={previewShape.fromY} x2={previewShape.toX} y2={previewShape.toY}
+                    stroke={color} strokeWidth={lineWidth} strokeLinecap="round" />
+                  <polygon
+                    points={`${previewShape.toX},${previewShape.toY} ${previewShape.toX - 16},${previewShape.toY - 7} ${previewShape.toX - 16},${previewShape.toY + 7}`}
+                    fill={color}
+                    transform={`rotate(${Math.atan2(previewShape.toY - previewShape.fromY, previewShape.toX - previewShape.fromX) * 180 / Math.PI} ${previewShape.toX} ${previewShape.toY})`}
+                  />
+                </>
+              )}
+              {previewShape?.shapeTool === 'rectangle' && (
+                <rect x={Math.min(previewShape.fromX, previewShape.toX)} y={Math.min(previewShape.fromY, previewShape.toY)}
+                  width={Math.abs(previewShape.toX - previewShape.fromX)} height={Math.abs(previewShape.toY - previewShape.fromY)}
+                  fill="none" stroke={color} strokeWidth={lineWidth} />
+              )}
+              {previewShape?.shapeTool === 'circle' && (
+                <ellipse
+                  cx={(previewShape.fromX + previewShape.toX) / 2}
+                  cy={(previewShape.fromY + previewShape.toY) / 2}
+                  rx={Math.abs(previewShape.toX - previewShape.fromX) / 2}
+                  ry={Math.abs(previewShape.toY - previewShape.fromY) / 2}
+                  fill="none" stroke={color} strokeWidth={lineWidth}
+                />
+              )}
+              {previewShape?.shapeTool === 'triangle' && (
+                <polygon
+                  points={`${(previewShape.fromX + previewShape.toX) / 2},${Math.min(previewShape.fromY, previewShape.toY)} ${Math.min(previewShape.fromX, previewShape.toX)},${Math.max(previewShape.fromY, previewShape.toY)} ${Math.max(previewShape.fromX, previewShape.toX)},${Math.max(previewShape.fromY, previewShape.toY)}`}
+                  fill="none" stroke={color} strokeWidth={lineWidth} strokeLinejoin="round"
+                />
+              )}
+              {previewShape?.shapeTool === 'star' && (() => {
+                const cx = previewShape.fromX;
+                const cy = previewShape.fromY;
+                const r = Math.hypot(previewShape.toX - cx, previewShape.toY - cy);
+                const pts = [];
+                for (let i = 0; i < 10; i++) {
+                  const a = -Math.PI / 2 + i * Math.PI / 5;
+                  const rr = i % 2 === 0 ? r : r * 0.5;
+                  pts.push(`${cx + Math.cos(a) * rr},${cy + Math.sin(a) * rr}`);
+                }
+                return <polygon points={pts.join(' ')} fill="none" stroke={color} strokeWidth={lineWidth} />;
+              })()}
+              {previewShape?.shapeTool === 'extract' && (
+                <rect x={Math.min(previewShape.fromX, previewShape.toX)} y={Math.min(previewShape.fromY, previewShape.toY)}
+                  width={Math.abs(previewShape.toX - previewShape.fromX)} height={Math.abs(previewShape.toY - previewShape.fromY)}
+                  fill="none" stroke="#2563eb" strokeWidth="1.5" strokeDasharray="5 5" />
+              )}
+            </svg>
+          )}
 
           {Object.values(remoteCursors).map((cursor) => (
             cursor?.visible && Number.isFinite(cursor.x) && Number.isFinite(cursor.y) ? (
               <div
                 key={cursor.clientId}
                 className="absolute z-30 pointer-events-none transition-transform duration-75"
-                style={{ left: `${cursor.x * boardFitScale * zoomScale + panOffset.x}px`, top: `${cursor.y * boardFitScale * zoomScale + panOffset.y}px`, transform: 'translate(-2px, -2px)' }}
+                style={{ left: `${cursor.x}px`, top: `${cursor.y}px`, transform: 'translate(-2px, -2px)' }}
               >
                 <div className="relative">
                   <div className={`w-0 h-0 border-l-[7px] border-l-transparent border-r-[7px] border-r-transparent border-b-[16px] ${cursor.isHost ? 'border-b-amber-500' : 'border-b-blue-600'} rotate-[-28deg] drop-shadow-sm`} />
