@@ -157,6 +157,10 @@ export default function App() {
   // Infinite Scroll & Zoom Viewport
   const [zoomScale, setZoomScale] = useState(1);
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
+  // Device-independent board scale: 100% means the same board proportions
+  // on phone, tablet and laptop. User zoom is applied on top of this fit scale.
+  const [boardFitScale, setBoardFitScale] = useState(1);
+  const boardFitScaleRef = useRef(1);
   const panOffsetRef = useRef({ x: 0, y: 0 });
   const zoomScaleRef = useRef(1);
 
@@ -242,6 +246,22 @@ export default function App() {
   useEffect(() => {
     zoomScaleRef.current = zoomScale;
   }, [zoomScale]);
+
+  useEffect(() => {
+    const updateBoardFitScale = () => {
+      const width = Math.max(320, window.innerWidth || 320);
+      const next = Math.min(1, Number((width / 4000).toFixed(6)));
+      boardFitScaleRef.current = next;
+      setBoardFitScale(next);
+    };
+    updateBoardFitScale();
+    window.addEventListener('resize', updateBoardFitScale);
+    window.visualViewport?.addEventListener('resize', updateBoardFitScale);
+    return () => {
+      window.removeEventListener('resize', updateBoardFitScale);
+      window.visualViewport?.removeEventListener('resize', updateBoardFitScale);
+    };
+  }, []);
 
   useEffect(() => { isHostRef.current = isHost; }, [isHost]);
   useEffect(() => { isCoHostRef.current = isCoHost; }, [isCoHost]);
@@ -1017,7 +1037,8 @@ export default function App() {
 
       if (e.ctrlKey || e.metaKey) {
         const zoomFactor = e.deltaY < 0 ? 1.05 : 0.95;
-        const newScale = Math.min(Math.max(Number((zoomScaleRef.current * zoomFactor).toFixed(2)), 0.3), 3.0);
+        const newScale = Math.min(Math.max(Number((zoomScaleRef.current * zoomFactor).toFixed(2)), 0.5), 2.5);
+        zoomScaleRef.current = newScale;
         setZoomScale(newScale);
 
         if ((isHost || isCoHost) && permissions.syncZoomGlobally) {
@@ -1375,8 +1396,9 @@ export default function App() {
     merged.height = window.innerHeight;
     const mCtx = merged.getContext('2d');
 
-    mCtx.drawImage(bgCanvas, -panOffset.x / zoomScale, -panOffset.y / zoomScale, window.innerWidth / zoomScale, window.innerHeight / zoomScale, 0, 0, window.innerWidth, window.innerHeight);
-    mCtx.drawImage(drawCanvas, -panOffset.x / zoomScale, -panOffset.y / zoomScale, window.innerWidth / zoomScale, window.innerHeight / zoomScale, 0, 0, window.innerWidth, window.innerHeight);
+    const renderScale = Math.max(0.0001, boardFitScale * zoomScale);
+    mCtx.drawImage(bgCanvas, -panOffset.x / renderScale, -panOffset.y / renderScale, window.innerWidth / renderScale, window.innerHeight / renderScale, 0, 0, window.innerWidth, window.innerHeight);
+    mCtx.drawImage(drawCanvas, -panOffset.x / renderScale, -panOffset.y / renderScale, window.innerWidth / renderScale, window.innerHeight / renderScale, 0, 0, window.innerWidth, window.innerHeight);
 
     const dataUrl = merged.toDataURL('image/png');
     const newSlide = {
@@ -1498,7 +1520,8 @@ export default function App() {
   const applyZoomAtPoint = (nextScale, clientX, clientY) => {
     const next = Math.max(0.5, Math.min(2.5, Number(nextScale.toFixed(2))));
     const canvas = drawCanvasRef.current;
-    const currentScale = zoomScaleRef.current;
+    const currentScale = Math.max(0.0001, boardFitScaleRef.current * zoomScaleRef.current);
+    const nextRenderScale = Math.max(0.0001, boardFitScaleRef.current * next);
     const currentPan = panOffsetRef.current;
 
     if (canvas && currentScale > 0) {
@@ -1508,8 +1531,8 @@ export default function App() {
       const worldX = (clientX - rect.left) / currentScale;
       const worldY = (clientY - rect.top) / currentScale;
       const nextPan = {
-        x: clientX - originX - worldX * next,
-        y: clientY - originY - worldY * next,
+        x: clientX - originX - worldX * nextRenderScale,
+        y: clientY - originY - worldY * nextRenderScale,
       };
       panOffsetRef.current = nextPan;
       setPanOffset(nextPan);
@@ -1891,6 +1914,27 @@ export default function App() {
     }
   }, [textInput.visible]);
 
+  // Mobile Safari/Chrome can delay remote WebRTC audio until a user gesture.
+  // Any normal interaction in the room is used to unlock already-created audio
+  // elements, so every participant can hear the active speaker without having
+  // to toggle their own microphone.
+  useEffect(() => {
+    if (!isSessionActive) return;
+    const unlockRemoteAudio = () => {
+      Object.values(remoteAudiosRef.current).forEach((audioEl) => {
+        if (audioEl?.srcObject) audioEl.play().catch(() => {});
+      });
+    };
+    window.addEventListener('pointerdown', unlockRemoteAudio, { passive: true });
+    window.addEventListener('touchstart', unlockRemoteAudio, { passive: true });
+    window.addEventListener('click', unlockRemoteAudio, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlockRemoteAudio);
+      window.removeEventListener('touchstart', unlockRemoteAudio);
+      window.removeEventListener('click', unlockRemoteAudio);
+    };
+  }, [isSessionActive]);
+
   const renderImageOnCanvas = (dataUrl) => {
     const img = new Image();
     img.onload = () => {
@@ -1898,8 +1942,13 @@ export default function App() {
       const bgCtx = bgCanvas.getContext('2d');
       bgCtx.fillStyle = '#ffffff';
       bgCtx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-      const x = Math.max(60, (window.innerWidth - img.width) / 2);
-      bgCtx.drawImage(img, x, 40);
+      // Keep the document in a shared world coordinate system. The board's
+      // responsive fit scale then makes the same page proportions appear on
+      // both phone and laptop instead of broadcasting a phone-sized PDF.
+      const targetWidth = Math.min(CANVAS_WIDTH - 160, 3600);
+      const targetHeight = img.width > 0 ? (img.height * targetWidth) / img.width : img.height;
+      const x = (CANVAS_WIDTH - targetWidth) / 2;
+      bgCtx.drawImage(img, x, 80, targetWidth, targetHeight);
       setHasDocument(true);
     };
     img.src = dataUrl;
@@ -2647,33 +2696,39 @@ export default function App() {
 
           /* Keep the bottom toolbar inside the safe area and make it horizontally scrollable. */
           .studysync-dock {
-            left: 50%;
-            right: auto;
+            left: 8px;
+            right: 8px;
             bottom: max(8px, env(safe-area-inset-bottom));
-            transform: translateX(-50%);
-            width: min(calc(100vw - 16px), 720px);
-            max-width: calc(100vw - 16px);
-            max-height: min(31dvh, 250px);
-            padding: 7px 8px;
-            border-radius: 16px;
-            gap: 7px;
-            justify-content: center;
-            align-content: center;
-            flex-wrap: wrap;
-            overflow-x: hidden;
-            overflow-y: auto;
-            overscroll-behavior: contain;
+            transform: none;
+            width: auto;
+            max-width: none;
+            height: 58px;
+            padding: 7px 9px;
+            border-radius: 17px;
+            gap: 8px;
+            justify-content: flex-start;
+            align-items: center;
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            overflow-y: hidden;
+            overscroll-behavior-x: contain;
+            overscroll-behavior-y: none;
             -webkit-overflow-scrolling: touch;
-            touch-action: pan-y;
+            touch-action: pan-x;
+            scroll-snap-type: x proximity;
           }
-          .studysync-dock > div { flex-shrink: 0; }
-          .studysync-dock > .h-6 { display: none; }
+          .studysync-dock > div { flex: 0 0 auto; flex-shrink: 0; }
+          .studysync-dock > .h-6 { display: block; flex: 0 0 1px; }
           .studysync-dock > div:first-child {
             display: flex;
             align-items: center;
+            flex: 0 0 auto;
           }
-          .studysync-dock > div:first-child span { min-width: 42px; text-align: center; }
+          .studysync-dock > div:first-child span { min-width: 44px; text-align: center; }
           .studysync-dock button { flex: 0 0 auto; }
+          .studysync-dock::before, .studysync-dock::after { content: ''; flex: 0 0 2px; }
+          .studysync-dock { scrollbar-width: none; }
+          .studysync-dock::-webkit-scrollbar { display: none; }
 
           /* Every popup fits the phone width and remains independently scrollable. */
           .studysync-panel {
@@ -3130,8 +3185,8 @@ export default function App() {
         <div
           className="fixed z-[60]"
           style={{
-            left: `${textInput.x * zoomScale + panOffset.x}px`,
-            top: `${textInput.y * zoomScale + panOffset.y + 56}px`,
+            left: `${textInput.x * boardFitScale * zoomScale + panOffset.x}px`,
+            top: `${textInput.y * boardFitScale * zoomScale + panOffset.y + 56}px`,
           }}
         >
           <textarea
@@ -3159,7 +3214,7 @@ export default function App() {
 
       {/* INFINITE EXPANDING CANVAS VIEWPORT */}
       <div ref={viewportRef} className="absolute inset-0 w-screen h-[100dvh] overflow-hidden pt-14 cursor-crosshair z-0 studysync-board-wrap" style={{ touchAction: 'none' }}>
-        <div style={{ transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`, transformOrigin: 'top left', width: `${CANVAS_WIDTH}px`, height: `${CANVAS_HEIGHT}px` }} className="relative top-0 left-0">
+        <div style={{ transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${boardFitScale * zoomScale})`, transformOrigin: 'top left', width: `${CANVAS_WIDTH}px`, height: `${CANVAS_HEIGHT}px` }} className="relative top-0 left-0">
           <canvas ref={bgCanvasRef} className="absolute top-0 left-0 pointer-events-none z-0 shadow-sm" />
           <canvas
             ref={drawCanvasRef}
@@ -3186,13 +3241,13 @@ export default function App() {
                   const center = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
                   const canvas = drawCanvasRef.current;
                   const rect = canvas?.getBoundingClientRect();
-                  const currentScale = zoomScaleRef.current;
+                  const currentRenderScale = Math.max(0.0001, boardFitScaleRef.current * zoomScaleRef.current);
                   const currentPan = panOffsetRef.current;
                   const originX = rect ? rect.left - currentPan.x : 0;
                   const originY = rect ? rect.top - currentPan.y : 0;
                   const focalWorld = {
-                    x: rect ? (center.x - rect.left) / currentScale : 0,
-                    y: rect ? (center.y - rect.top) / currentScale : 0,
+                    x: rect ? (center.x - rect.left) / currentRenderScale : 0,
+                    y: rect ? (center.y - rect.top) / currentRenderScale : 0,
                   };
 
                   pinchGestureRef.current = {
@@ -3226,9 +3281,11 @@ export default function App() {
                   const center = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
                   const gesture = pinchGestureRef.current;
                   const nextScale = Math.max(0.5, Math.min(2.5, Number((gesture.startScale * (distance / gesture.startDistance)).toFixed(2))));
+                  const nextRenderScale = Math.max(0.0001, boardFitScaleRef.current * nextScale);
+                  // Keep the two-finger focal point locked while scaling.
                   const nextPan = {
-                    x: center.x - gesture.startOrigin.x - gesture.focalWorld.x * nextScale,
-                    y: center.y - gesture.startOrigin.y - gesture.focalWorld.y * nextScale,
+                    x: center.x - gesture.startOrigin.x - gesture.focalWorld.x * nextRenderScale,
+                    y: center.y - gesture.startOrigin.y - gesture.focalWorld.y * nextRenderScale,
                   };
                   zoomScaleRef.current = nextScale;
                   panOffsetRef.current = nextPan;
@@ -3281,7 +3338,7 @@ export default function App() {
               <div
                 key={cursor.clientId}
                 className="absolute z-30 pointer-events-none transition-transform duration-75"
-                style={{ left: `${cursor.x}px`, top: `${cursor.y}px`, transform: 'translate(-2px, -2px)' }}
+                style={{ left: `${cursor.x * boardFitScale * zoomScale + panOffset.x}px`, top: `${cursor.y * boardFitScale * zoomScale + panOffset.y}px`, transform: 'translate(-2px, -2px)' }}
               >
                 <div className="relative">
                   <div className={`w-0 h-0 border-l-[7px] border-l-transparent border-r-[7px] border-r-transparent border-b-[16px] ${cursor.isHost ? 'border-b-amber-500' : 'border-b-blue-600'} rotate-[-28deg] drop-shadow-sm`} />
