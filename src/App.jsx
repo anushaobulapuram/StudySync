@@ -1489,15 +1489,11 @@ export default function App() {
   };
 
   const handleZoom = (delta) => {
-    const newScale = Math.min(Math.max(Number((zoomScaleRef.current + delta).toFixed(2)), 0.3), 3.0);
-    setZoomScale(newScale);
-    if (isHost && permissions.syncZoomGlobally) {
-      channelRef.current?.send({
-        type: 'broadcast',
-        event: 'sync-view',
-        payload: { scale: newScale, pan: panOffsetRef.current },
-      });
-    }
+    setZoomScale((prev) => {
+      const next = Math.max(0.5, Math.min(2.5, Number((prev + delta).toFixed(2))));
+      zoomScaleRef.current = next;
+      return next;
+    });
   };
 
   const handleResetZoom = () => {
@@ -2590,29 +2586,104 @@ export default function App() {
   return (
     <div className="relative w-screen h-[100dvh] overflow-hidden select-none font-['Inter',sans-serif] bg-slate-100 text-slate-800 studysync-app" style={{ touchAction: 'none' }}>
       <style>{`
-        .studysync-app, .studysync-app * { -webkit-tap-highlight-color: transparent; }
-        .studysync-header { overflow-x: auto; scrollbar-width: none; }
+        .studysync-app, .studysync-app * { -webkit-tap-highlight-color: transparent; }\n        html, body, #root { max-width: 100%; overflow-x: hidden; }
+        .studysync-header { overflow-x: auto; scrollbar-width: none; touch-action: pan-x; overscroll-behavior-x: contain; }
         .studysync-header::-webkit-scrollbar, .studysync-dock::-webkit-scrollbar { display: none; }
         .studysync-header > div { flex-shrink: 0; }
-        .studysync-dock { max-width: calc(100vw - 24px); overflow-x: auto; overflow-y: visible; scrollbar-width: none; }
+        .studysync-dock { max-width: calc(100vw - 24px); overflow-x: auto; overflow-y: visible; scrollbar-width: none; touch-action: pan-x; overscroll-behavior-x: contain; }
         .studysync-dock > div { flex-shrink: 0; }
+        .studysync-panel { overscroll-behavior: contain; }
         @media (max-width: 768px) {
-          .studysync-header { height: 56px; padding-left: 8px; padding-right: 8px; justify-content: flex-start; gap: 10px; }
+          .studysync-header { height: 56px; padding-left: max(8px, env(safe-area-inset-left)); padding-right: max(8px, env(safe-area-inset-right)); justify-content: flex-start; gap: 10px; }
           .studysync-header > div { gap: 6px; }
-          .studysync-header button { min-height: 38px; }
+          .studysync-header button, .studysync-dock button { min-height: 42px; touch-action: manipulation; }
           .studysync-header .font-mono { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-          .studysync-dock { left: 8px; right: 8px; bottom: max(8px, env(safe-area-inset-bottom)); transform: none; max-width: none; width: auto; padding: 6px 8px; border-radius: 16px; gap: 8px; justify-content: flex-start; }
-          .studysync-dock button { touch-action: manipulation; }
-          .studysync-panel { left: 12px !important; right: 12px !important; width: auto !important; max-width: none !important; }
-          .studysync-slides-panel { max-height: 62vh; }
-          .studysync-chat-panel { height: min(480px, 68vh) !important; }
-          .studysync-notes-panel { max-height: 72vh; }
-          .studysync-notes-panel textarea { height: min(46vh, 360px) !important; }
+
+          /* The drawing area must start below the real mobile header, not underneath it. */
+          .studysync-app > .studysync-header ~ .absolute.inset-0 {
+            top: 56px !important;
+            bottom: 0 !important;
+            height: auto !important;
+            padding-top: 0 !important;
+            width: 100vw !important;
+            touch-action: none !important;
+          }
+
+          /* Keep the bottom toolbar inside the safe area and make it horizontally scrollable. */
+          .studysync-dock {
+            left: max(8px, env(safe-area-inset-left));
+            right: max(8px, env(safe-area-inset-right));
+            bottom: max(8px, env(safe-area-inset-bottom));
+            transform: none;
+            max-width: none;
+            width: auto;
+            padding: 6px 8px;
+            border-radius: 16px;
+            gap: 8px;
+            justify-content: flex-start;
+            -webkit-overflow-scrolling: touch;
+          }
+          .studysync-dock > div { flex-shrink: 0; }
+
+          /* Every popup fits the phone width and remains independently scrollable. */
+          .studysync-panel {
+            left: 10px !important;
+            right: 10px !important;
+            width: auto !important;
+            max-width: none !important;
+            top: 64px !important;
+            max-height: calc(100dvh - 124px) !important;
+            overflow: hidden;
+            overscroll-behavior: contain;
+            touch-action: auto;
+          }
+          .studysync-panel .overflow-y-auto {
+            overscroll-behavior: contain;
+            -webkit-overflow-scrolling: touch;
+            touch-action: pan-y;
+          }
+          .studysync-slides-panel { max-height: calc(100dvh - 124px) !important; }
+          .studysync-chat-panel { height: min(480px, calc(100dvh - 124px)) !important; }
+          .studysync-notes-panel { max-height: calc(100dvh - 124px) !important; }
+          .studysync-notes-panel textarea { height: min(42vh, 300px) !important; touch-action: auto; }
+
+          /* Avoid browser text selection/dragging while drawing, but allow inputs to work normally. */
+          input, textarea, button, select { -webkit-user-select: auto; }
+          canvas { -webkit-user-select: none; user-select: none; }
+        }
+        /* Mobile board: pinch/zoom belongs to the browser/app viewport, while
+           the tool dock keeps its own horizontal gesture area. */
+        .studysync-board-wrap {
+          touch-action: none;
+          overscroll-behavior: none;
+          -webkit-user-select: none;
+          user-select: none;
+        }
+        .studysync-board-wrap canvas {
+          touch-action: none;
+          -webkit-user-select: none;
+          user-select: none;
+        }
+        @media (max-width: 768px) {
+          .studysync-board-wrap {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+          }
+          .studysync-dock {
+            z-index: 60;
+          }
         }
         @media (max-width: 420px) {
           .studysync-header .studysync-brand-name { display: none; }
           .studysync-header { gap: 7px; }
           .studysync-dock { max-width: none; }
+          .studysync-panel { left: 8px !important; right: 8px !important; }
+        }
+        @media (orientation: landscape) and (max-width: 900px) {
+          .studysync-header { height: 50px; }
+          .studysync-app > .studysync-header ~ .absolute.inset-0 { top: 50px !important; }
+          .studysync-panel { top: 58px !important; max-height: calc(100dvh - 108px) !important; }
         }
       `}</style>
 
