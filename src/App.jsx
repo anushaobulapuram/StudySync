@@ -561,11 +561,9 @@ export default function App() {
         if (key !== myClientId && isHostRef.current) {
           safeBroadcast('board-state', { to: key, elements: elementsRef.current });
         }
-        if (
-          key !== myClientId &&
-          localStreamRef.current?.getAudioTracks()?.[0]?.enabled &&
-          myClientId < key
-        ) {
+        if (key !== myClientId && myClientId < key) {
+          // Establish the audio receive/send path for every participant.
+          // Mic OFF simply means our transceiver sends silence/no track.
           negotiateWithPeer(key);
         }
       })
@@ -726,7 +724,7 @@ export default function App() {
       .on('broadcast', { event: 'webrtc-renegotiate-request' }, ({ payload }) => {
         const fromPeerId = payload?.from;
         if (!fromPeerId || fromPeerId === myClientId) return;
-        if (myClientId < fromPeerId && localStreamRef.current?.getAudioTracks()?.[0]?.enabled) {
+        if (myClientId < fromPeerId) {
           negotiateWithPeer(fromPeerId);
         }
       })
@@ -782,15 +780,14 @@ export default function App() {
           }
 
           // Presence sync can contain peers that joined before this client.
-          // The smaller client ID is the sole offer initiator.
-          if (localStreamRef.current?.getAudioTracks()?.[0]?.enabled) {
-            const state = channel.presenceState();
-            Object.keys(state).forEach((peerId) => {
-              if (peerId !== myClientId && myClientId < peerId) {
-                negotiateWithPeer(peerId);
-              }
-            });
-          }
+          // The smaller client ID is the sole offer initiator. We negotiate
+          // even with mic OFF so everyone is ready to hear a later speaker.
+          const state = channel.presenceState();
+          Object.keys(state).forEach((peerId) => {
+            if (peerId !== myClientId && myClientId < peerId) {
+              negotiateWithPeer(peerId);
+            }
+          });
         }
       });
 
@@ -865,6 +862,62 @@ export default function App() {
     laserPointsRef.current.push({ x, y, time: Date.now(), isStart });
   };
 
+  const drawSmoothPath = (ctx, points) => {
+    if (!ctx || !Array.isArray(points) || points.length === 0) return;
+    if (points.length === 1) {
+      ctx.beginPath();
+      ctx.arc(points[0].x, points[0].y, Math.max(1, ctx.lineWidth / 2), 0, Math.PI * 2);
+      ctx.fill();
+      return;
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    if (points.length === 2) {
+      ctx.lineTo(points[1].x, points[1].y);
+      ctx.stroke();
+      return;
+    }
+
+    // Quadratic midpoint smoothing: the curve passes through the
+    // midpoints of consecutive samples, removing the visible "polygon"
+    // look when a finger/stylus moves freely.
+    for (let i = 1; i < points.length - 1; i++) {
+      const current = points[i];
+      const next = points[i + 1];
+      const midX = (current.x + next.x) / 2;
+      const midY = (current.y + next.y) / 2;
+      ctx.quadraticCurveTo(current.x, current.y, midX, midY);
+    }
+
+    const last = points[points.length - 1];
+    ctx.quadraticCurveTo(last.x, last.y, last.x, last.y);
+    ctx.stroke();
+  };
+
+  const pointsToSvgPath = (points) => {
+    if (!Array.isArray(points) || points.length === 0) return '';
+    if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
+
+    let d = `M ${points[0].x} ${points[0].y}`;
+    if (points.length === 2) {
+      return `${d} L ${points[1].x} ${points[1].y}`;
+    }
+
+    for (let i = 1; i < points.length - 1; i++) {
+      const p = points[i];
+      const n = points[i + 1];
+      const mx = (p.x + n.x) / 2;
+      const my = (p.y + n.y) / 2;
+      d += ` Q ${p.x} ${p.y} ${mx} ${my}`;
+    }
+
+    const last = points[points.length - 1];
+    d += ` Q ${last.x} ${last.y} ${last.x} ${last.y}`;
+    return d;
+  };
+
   const redrawCanvas = () => {
     const ctx = drawCtxRef.current;
     const canvas = drawCanvasRef.current;
@@ -892,13 +945,8 @@ export default function App() {
         ctx.lineCap = 'round';
       }
 
-      if (el.type === 'stroke' && el.points && el.points.length > 1) {
-        ctx.beginPath();
-        ctx.moveTo(el.points[0].x, el.points[0].y);
-        for (let i = 1; i < el.points.length; i++) {
-          ctx.lineTo(el.points[i].x, el.points[i].y);
-        }
-        ctx.stroke();
+      if (el.type === 'stroke' && el.points && el.points.length > 0) {
+        drawSmoothPath(ctx, el.points);
       } else if (el.type === 'shape') {
         drawShapeDirect(ctx, el.shapeTool, el.fromX, el.fromY, el.toX, el.toY);
       } else if (el.type === 'text') {
@@ -920,9 +968,19 @@ export default function App() {
     });
   };
 
-  const broadcastElement = (element) => {
+  const broadcastElement = async (element) => {
     if (!element) return;
-    safeBroadcast('board-add', { element }, { queue: true });
+
+    const payload = { element };
+    // Board strokes are incremental. Retry a few times because Supabase
+    // broadcast can transiently return a non-ok status while a mobile client
+    // is reconnecting. Never replace the whole board for a normal stroke.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const sent = await safeBroadcast('board-add', payload, { queue: true });
+      if (sent) return true;
+      await new Promise((resolve) => setTimeout(resolve, 120 * (attempt + 1)));
+    }
+    return false;
   };
 
   const broadcastUpdatedElement = (element) => {
@@ -1426,15 +1484,50 @@ export default function App() {
     doc.save(`StudySync-${roomId}-Lectures.pdf`);
   };
 
-  const updateHostPermission = (key, value) => {
+  const updateHostPermission = async (key, value) => {
     if (!isHost) return;
-    const updated = { ...permissions, [key]: value };
+
+    const updated = { ...permissionsRef.current, [key]: value };
+    permissionsRef.current = updated;
     setPermissions(updated);
-    channelRef.current?.send({
-      type: 'broadcast',
-      event: 'permissions-update',
-      payload: updated,
-    });
+
+    // Persist global permissions so guests who join later receive the same
+    // setting from study_rooms instead of falling back to the old default.
+    try {
+      const { error } = await supabase
+        .from('study_rooms')
+        .update({ permissions: updated })
+        .eq('room_id', roomId);
+      if (error) console.warn('Could not persist room permissions:', error);
+    } catch (err) {
+      console.warn('Permission persistence error:', err);
+    }
+
+    // A global permission is explicitly an "all guests" switch. Clear any
+    // stale per-participant override for this same permission so a previous
+    // individual OFF cannot silently block the new global ON.
+    if (['canDraw', 'canText', 'canUpload', 'canVoiceChat', 'canSharePointer'].includes(key)) {
+      const overrideKey = key === 'canVoiceChat' ? 'canVoice' : key;
+      const currentOverrides = participantOverrides;
+      const nextOverrides = { ...currentOverrides };
+
+      Object.keys(nextOverrides).forEach((clientId) => {
+        if (!nextOverrides[clientId]) return;
+        const cleared = { ...nextOverrides[clientId], [overrideKey]: null };
+        nextOverrides[clientId] = cleared;
+
+        // Immediately update every currently connected participant so the
+        // global "Allow all" action takes effect without requiring refresh.
+        safeBroadcast('individual-permission-update', {
+          targetClientId: clientId,
+          permissions: cleared,
+        });
+      });
+
+      setParticipantOverrides(nextOverrides);
+    }
+
+    await safeBroadcast('permissions-update', updated);
   };
 
   const toggleCoHostStatus = (targetClientId) => {
@@ -1637,16 +1730,21 @@ export default function App() {
       }
     };
 
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        const alreadyAdded = pc.getSenders().some((sender) => sender.track?.kind === track.kind);
-        if (!alreadyAdded) pc.addTrack(track, localStreamRef.current);
-      });
-    } else {
-      // Keep an audio receiving path ready even before this user turns on mic.
-      try {
-        pc.addTransceiver('audio', { direction: 'recvonly' });
-      } catch (err) {}
+    // Always create exactly one audio transceiver per peer. It is sendrecv
+    // even when our microphone is OFF, so a peer can start speaking later
+    // without needing a second m-line/connection.
+    let audioTransceiver = null;
+    try {
+      audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    } catch (err) {
+      console.warn('Audio transceiver setup failed:', err);
+    }
+
+    if (audioTransceiver?.sender && localStreamRef.current) {
+      const localTrack = localStreamRef.current.getAudioTracks()?.[0];
+      if (localTrack) {
+        audioTransceiver.sender.replaceTrack(localTrack).catch(() => {});
+      }
     }
 
     peerConnectionsRef.current[targetPeerId] = pc;
@@ -1748,9 +1846,7 @@ export default function App() {
         Object.entries(peerConnectionsRef.current).forEach(([peerId, pc]) => {
           const audioSender = pc.getSenders().find((sender) => sender.track?.kind === 'audio');
           if (audioSender) {
-            audioSender.replaceTrack(track);
-          } else {
-            pc.addTrack(track, stream);
+            audioSender.replaceTrack(track).catch(() => {});
           }
         });
       });
@@ -2130,22 +2226,72 @@ export default function App() {
       }
       ctx.stroke();
 
-      const result = await Tesseract.recognize(canvas, 'eng', {
-        tessedit_pageseg_mode: '10',
-        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
-        logger: () => {},
-      });
+      // Single-character OCR is much more reliable when Tesseract gets a
+      // clean, high-contrast crop. Try several segmentation modes because
+      // handwriting varies a lot between alphabets and digits.
+      const variants = [];
 
-      const detected = String(result?.data?.text || '')
-        .replace(/[^A-Za-z0-9]/g, '')
-        .trim();
+      const runOcr = async (psm, image) => {
+        try {
+          const result = await Tesseract.recognize(image, 'eng', {
+            tessedit_pageseg_mode: String(psm),
+            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
+            preserve_interword_spaces: '0',
+            logger: () => {},
+          });
+          const text = String(result?.data?.text || '')
+            .replace(/[^A-Za-z0-9]/g, '')
+            .trim();
+          const confidence = Number(result?.data?.confidence || 0);
+          if (text) variants.push({ text, confidence });
+        } catch (_) {}
+      };
 
-      if (!detected || detected.length > 2) return null;
+      await runOcr(10, canvas); // one character
+      await runOcr(8, canvas);  // one word / symbol-like glyph
+      await runOcr(13, canvas); // raw single-line glyph
 
-      const char = detected[0];
-      if (!/[A-Za-z0-9]/.test(char)) return null;
+      // A small thresholded version helps with faint/stylus strokes.
+      const thresholdCanvas = document.createElement('canvas');
+      thresholdCanvas.width = canvas.width;
+      thresholdCanvas.height = canvas.height;
+      const tctx = thresholdCanvas.getContext('2d');
+      if (tctx) {
+        tctx.fillStyle = '#ffffff';
+        tctx.fillRect(0, 0, thresholdCanvas.width, thresholdCanvas.height);
+        tctx.drawImage(canvas, 0, 0);
+        const image = tctx.getImageData(0, 0, thresholdCanvas.width, thresholdCanvas.height);
+        for (let i = 0; i < image.data.length; i += 4) {
+          const v = (image.data[i] + image.data[i + 1] + image.data[i + 2]) / 3;
+          const out = v < 205 ? 20 : 255;
+          image.data[i] = out;
+          image.data[i + 1] = out;
+          image.data[i + 2] = out;
+          image.data[i + 3] = 255;
+        }
+        tctx.putImageData(image, 0, 0);
+        await runOcr(10, thresholdCanvas);
+        await runOcr(13, thresholdCanvas);
+      }
 
-      return char;
+      const candidates = variants
+        .map((v) => ({
+          char: v.text[0],
+          confidence: v.confidence,
+          exactOne: v.text.length === 1,
+        }))
+        .filter((v) => /^[A-Za-z0-9]$/.test(v.char))
+        .sort((a, b) => Number(b.exactOne) - Number(a.exactOne) || b.confidence - a.confidence);
+
+      if (!candidates.length) return null;
+
+      // Prefer a genuine single-character result. If confidence is weak,
+      // keep the original freehand stroke instead of inserting a wrong glyph.
+      const best = candidates[0];
+      if (!best.exactOne && best.confidence < 45) return null;
+      if (best.confidence > 0 && best.confidence < 35) return null;
+
+      return best.char;
     } catch (err) {
       console.warn('Smart character recognition unavailable:', err);
       return null;
@@ -2453,9 +2599,17 @@ export default function App() {
 
     if (['pencil', 'highlighter', 'smart'].includes(tool)) {
       const t = Date.now() - strokeStartTimeRef.current;
-      currentStrokeRef.current.push({ x, y, t });
+      const points = currentStrokeRef.current;
+      const last = points[points.length - 1];
+      // Ignore sub-pixel noise but keep enough samples for natural curves.
+      if (!last || Math.hypot(x - last.x, y - last.y) >= 1.5) {
+        points.push({ x, y, t });
+      }
+
       setPreviewPoints((prev) => {
-        const next = prev.length > 500 ? prev.slice(-400) : prev;
+        const lastPreview = prev[prev.length - 1];
+        if (lastPreview && Math.hypot(x - lastPreview.x, y - lastPreview.y) < 1.5) return prev;
+        const next = prev.length > 700 ? prev.slice(-550) : prev;
         return [...next, { x, y }];
       });
       return;
@@ -3202,8 +3356,8 @@ export default function App() {
               style={{ overflow: 'visible' }}
             >
               {previewPoints.length > 1 && (
-                <polyline
-                  points={previewPoints.map((p) => `${p.x},${p.y}`).join(' ')}
+                <path
+                  d={pointsToSvgPath(previewPoints)}
                   fill="none"
                   stroke={tool === 'highlighter' ? (color === '#0f172a' ? '#facc15' : color) : color}
                   strokeWidth={tool === 'highlighter' ? lineWidth * 5 : lineWidth}
